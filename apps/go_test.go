@@ -2,10 +2,27 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sync"
+	"testing"
 )
 
-func main() {
+func TestScanf(t *testing.T) {
+	var depth int64
+
+	f, err := os.OpenFile("input.txt", os.O_RDONLY, 0600)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	_, err = fmt.Fscanf(f, "%d\n", &depth)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(depth)
+}
+
+func TestPool(t *testing.T) {
 	p := &sync.Pool{
 		New: func() interface{} {
 			return 0
