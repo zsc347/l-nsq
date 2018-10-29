@@ -497,7 +497,11 @@ func (d *diskQueue) moveForward() {
 }
 
 // handle when read error occured
+// How ? ignore current file and jump to next file
+// if current write file is read file which got error,
+// then also move forward write file
 func (d *diskQueue) handleReadError() {
+	// jump to the next read file and rename the current (bad) file
 	if d.readFileNum == d.writeFileNum {
 		if d.writeFile != nil {
 			d.writeFile.Close()
@@ -523,6 +527,7 @@ func (d *diskQueue) handleReadError() {
 	d.readFileNum++
 	d.readPos = 0
 	d.nextReadFileNum = d.readFileNum
+	d.nextReadPos = 0
 
 	// significant state change, schedule a sync on the next iteration
 	d.needSync = true
