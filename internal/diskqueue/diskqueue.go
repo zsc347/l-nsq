@@ -359,6 +359,17 @@ func (d *diskQueue) writeOne(data []byte) error {
 	d.writeBuf.Reset()
 	err = binary.Write(&d.writeBuf, binary.BigEndian, dataLen)
 	if err != nil {
+		return err
+	}
+
+	_, err = d.writeBuf.Write(data)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.writeFile.Write(d.writeBuf.Bytes())
+
+	if err != nil {
 		d.writeFile.Close()
 		d.writeFile = nil
 		return err
@@ -459,11 +470,11 @@ func (d *diskQueue) retrieveMetaData() error {
 }
 
 func (d *diskQueue) metaDataFileName() string {
-	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.meta.dat", d.name))
+	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.meta.dat"), d.name)
 }
 
 func (d *diskQueue) fileName(fileNum int64) string {
-	return fmt.Sprintf(path.Join(d.dataPath), "%s.diskqueue.%06d.dat", d.name, fileNum)
+	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.%06d.dat"), d.name, fileNum)
 }
 
 func (d *diskQueue) moveForward() {
