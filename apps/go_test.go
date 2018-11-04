@@ -46,3 +46,13 @@ func TestPool(t *testing.T) {
 		fmt.Println("unknown", value)
 	}
 }
+
+func call(x int) (y int) {
+	fmt.Println(x)
+	fmt.Println(y)
+	return
+}
+
+func TestCall(t *testing.T) {
+	fmt.Println(call(4))
+}
