@@ -5,7 +5,9 @@ import (
 )
 
 type NSQD struct {
-	opts atomic.Value
+	// 64bit atomic vars need to be first for proper alignment on 32bit paltforms
+	clientIDSequence int64
+	opts             atomic.Value
 }
 
 func (n *NSQD) getOpts() *Options {
