@@ -421,7 +421,7 @@ walk: // Outer loop for walking the tree
 // It returns the case-corrected path and a bool indicating whether the lookup
 // was successful.
 func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPath []byte, found bool) {
-	ciPath = make([]byte, 0, len(path)+1) // preallocate enouth memory
+	ciPath = make([]byte, 0, len(path)+1) // preallocate enough memory
 
 	// Outer loop for walking the tree
 	for len(path) >= len(n.path) && strings.ToLower(path[:len(n.path)]) == strings.ToLower(n.path) {
@@ -436,7 +436,7 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 				r := unicode.ToLower(rune(path[0]))
 				for i, index := range n.indices {
 					// must use recursive approach since both index and
-					// ToLower(index) could exist. We must check both
+					// ToLower(index) could exist. We must check both.
 					if r == unicode.ToLower(index) {
 						out, found := n.children[i].findCaseInsensitivePath(path, fixTrailingSlash)
 						if found {
@@ -446,7 +446,7 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 				}
 
 				// Nothing found. We can recommend to redirect to the same URL
-				// without a trailing slash if a leaft exists for that path
+				// without a trailing slash if a leaf exists for that path
 				found = (fixTrailingSlash && path == "/" && n.handle != nil)
 				return
 			}
@@ -471,7 +471,7 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 						continue
 					}
 
-					// .. but we can't
+					// ... but we can't
 					if fixTrailingSlash && len(path) == k+1 {
 						return ciPath, true
 					}
@@ -497,14 +497,14 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 				panic("invalid node type")
 			}
 		} else {
-			// We should habe reached the node containing the handle
+			// We should have reached the node containing the handle.
 			// Check if this node has a handle registered.
 			if n.handle != nil {
 				return ciPath, true
 			}
 
-			// No  handle found
-			// Try to fix the path by  adding a trailing slash
+			// No handle found.
+			// Try to fix the path by adding a trailing slash
 			if fixTrailingSlash {
 				for i := 0; i < len(n.indices); i++ {
 					if n.indices[i] == '/' {
@@ -521,14 +521,14 @@ func (n *node) findCaseInsensitivePath(path string, fixTrailingSlash bool) (ciPa
 		}
 	}
 
-	// Nothing found
+	// Nothing found.
 	// Try to fix the path by adding / removing a trailing slash
 	if fixTrailingSlash {
 		if path == "/" {
 			return ciPath, true
 		}
 		if len(path)+1 == len(n.path) && n.path[len(path)] == '/' &&
-			strings.ToLower(path) == strings.ToLower(n.path)[:len(path)] &&
+			strings.ToLower(path) == strings.ToLower(n.path[:len(path)]) &&
 			n.handle != nil {
 			return append(ciPath, n.path...), true
 		}
