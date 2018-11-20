@@ -11,8 +11,8 @@ type getter interface {
 }
 
 func GetTopicChannelArgs(rp getter) (string, string, error) {
-	topicName, err := rp.Get("topic")
 
+	topicName, err := rp.Get("topic")
 	if err != nil {
 		return "", "", errors.New("MISSING_ARG_TOPIC")
 	}
@@ -23,6 +23,9 @@ func GetTopicChannelArgs(rp getter) (string, string, error) {
 
 	channelName, err := rp.Get("channel")
 	if err != nil {
+		return "", "", errors.New("MISSING_ARG_CHANNEL")
+	}
+	if !protocol.IsValidChannelName(channelName) {
 		return "", "", errors.New("INVALID_ARG_CHANNEL")
 	}
 	return topicName, channelName, nil
