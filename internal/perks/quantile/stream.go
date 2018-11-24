@@ -19,11 +19,33 @@ func (a Samples) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 
 type invariant func(s *stream, r float64) float64
 
+// NewBiased returns an initialized Stream for high-biased quantiles
+// (e.g. 50th, 90th, 99th) not known a priori with finer error guarantees for
+// the higher ranks of the data distribution
 func NewBiased() *Stream {
-	f := func(s *stream, r float64) float64 {
+	fc := func(s *stream, r float64) float64 {
 		return 2 * s.epsilon * r
 	}
-	return newStream(f)
+	return newStream(fc)
+}
+
+func NewTargeted(quantiles ...float64) *Stream {
+	fc := func(s *stream, r float64) float64 {
+		var m = math.MaxFloat64
+		var f float64
+		for _, q := range quantiles {
+			if q*s.n <= r {
+				f = (2 * s.epsilon * r) / q
+			} else {
+				f = (2 * s.epsilon * (s.n - r)) / (1 - q)
+			}
+			if f < m {
+				m = f
+			}
+		}
+		return m
+	}
+	return newStream(fc)
 }
 
 func newStream(f invariant) *Stream {
@@ -80,8 +102,18 @@ type stream struct {
 
 func (s *Stream) Query(q float64) float64 {
 	if !s.flushed() {
-
+		l := len(s.b)
+		if l == 0 {
+			return 0
+		}
+		i := int(float64(l) * q)
+		if i > 0 {
+			i -= 1
+		}
+		s.maybeSort()
+		return s.b[i].Value
 	}
+
 	s.flush()
 	return s.stream.query(q)
 }
