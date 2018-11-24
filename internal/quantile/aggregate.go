@@ -85,7 +85,7 @@ func (e *E2eProcessingLatencyAggregate) Add(e2 *E2eProcessingLatencyAggregate) {
 		}
 
 		p[i]["max"] = math.Max(value["max"], p[i]["max"])
-		p[i]["min"] = math.Min(value["max"], p[i]["max"]) // ?!! why not min of e2 min and e min
+		p[i]["min"] = math.Min(value["max"], p[i]["max"]) // !!! "min" seems more senseful here
 		p[i]["count"] += value["count"]
 
 		if p[i]["count"] == 0 {
