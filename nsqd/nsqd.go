@@ -18,6 +18,10 @@ func (n *NSQD) getOpts() *Options {
 	return n.opts.Load().(*Options)
 }
 
+func (n *NSQD) Notify(v interface{}) {
+	// TODO
+}
+
 type Client interface {
 	Stats() ClientStats
 	IsProducer() bool
