@@ -1,9 +1,12 @@
 package nsqd
 
 import (
+	"bytes"
+	"errors"
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/l-nsq/internal/lg"
 
@@ -126,4 +129,121 @@ func (c *Channel) initPQ() {
 	c.deferedMessages = make(map[MessageID]*pqueue.Item)
 	c.deferedPQ = pqueue.New(pqSize)
 	c.deferredMutex.Unlock()
+}
+
+// Exiting returns a boolean indicating if this channel is closed/exiting
+func (c *Channel) Exiting() bool {
+	return atomic.LoadInt32(&c.exitFlag) == 1
+}
+
+// Delete empties the channel and closes
+func (c *Channel) Delete() error {
+	return c.exit(true)
+}
+
+// cleanly mean whether write message to backend queue
+// if cleanly, message will write to backend queue for recover
+
+// Close cleanly closes the Channel
+func (c *Channel) Close() error {
+	return c.exit(false)
+}
+
+func (c *Channel) exit(deleted bool) error {
+	c.exitMutex.Lock()
+	defer c.exitMutex.Unlock()
+
+	if !atomic.CompareAndSwapInt32(&c.exitFlag, 0, 1) {
+		return errors.New("exiting")
+	}
+
+	if deleted {
+		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): deleting", c.name)
+
+		// since we are explicitly deleting a channel ( not just at system exit time)
+		// de-register this from the lookupd
+		c.ctx.nsqd.Notify(c)
+	} else {
+		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): closing", c.name)
+	}
+
+	// this forceably closes client connections
+	c.RLock()
+	for _, client := range c.clients {
+		client.Close()
+	}
+	c.RUnlock()
+
+	if deleted {
+		// empty the queue (deletes the backend files, too)
+		c.Empty()
+		return c.backend.Delete()
+	}
+	c.flush()
+	return c.backend.Close()
+}
+
+func (c *Channel) Empty() error {
+	c.Lock()
+	defer c.Unlock()
+
+	// empty queques
+	c.initPQ() // clean queues
+
+	// empty client
+	for _, client := range c.clients {
+		client.Empty()
+	}
+
+	// empty memory chan
+	for {
+		select {
+		case <-c.memoryMsgChan:
+		default:
+			goto finish
+		}
+	}
+finish:
+	return c.backend.Empty()
+}
+
+func (c *Channel) flush() error {
+	var msgBuf bytes.Buffer
+
+	if len(c.memoryMsgChan) > 0 || len(c.inFlightMessages) > 0 || len(c.deferedMessages) > 0 {
+		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): flushing %d memory %d in-flight %d defered messages to backend",
+			c.name, len(c.memoryMsgChan), len(c.inFlightMessages), len(c.deferedMessages))
+	}
+
+	for {
+		select {
+		case msg := <-c.memoryMsgChan:
+			err := writeMessageToBackend(&msgBuf, msg, c.backend)
+			if err != nil {
+				c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+			}
+		default:
+			goto finish
+		}
+	}
+finish:
+	c.inFlightMutex.Lock()
+	for _, msg := range c.inFlightMessages {
+		err := writeMessageToBackend(&msgBuf, msg, c.backend)
+		if err != nil {
+			c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+		}
+	}
+	c.inFlightMutex.Unlock()
+
+	c.deferredMutex.Lock()
+	for _, item := range c.deferedMessages {
+		msg := item.Value.(*Message)
+		err := writeMessageToBackend(&msgBuf, msg, c.backend)
+		if err != nil {
+			c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+		}
+	}
+	c.deferredMutex.Unlock()
+	return nil
 }
