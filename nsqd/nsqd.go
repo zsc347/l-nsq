@@ -16,6 +16,7 @@ type NSQD struct {
 	opts atomic.Value
 
 	isLoading int32
+	errValue  atomic.Value // set by channel, set each time when put message
 
 	clientLock sync.RWMutex
 	clients    map[int64]Client
@@ -56,6 +57,10 @@ func (n *NSQD) Notify(v interface{}) {
 func (n *NSQD) PersistMetadata() error {
 	// TODO
 	return nil
+}
+
+func (n *NSQD) SetHealth(err error) {
+	n.er
 }
 
 type Client interface {

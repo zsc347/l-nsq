@@ -22,4 +22,7 @@ type Options struct {
 
 	// msg and command options
 	MaxMsgSize int64 `flag:"max-msg-size"`
+
+	// msg and command options
+	MaxMsgTimeout time.Duration `flag:"max-msg-timeout"`
 }

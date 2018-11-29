@@ -2,11 +2,13 @@ package nsqd
 
 import (
 	"bytes"
+	"container/heap"
 	"errors"
 	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/l-nsq/internal/lg"
 
@@ -246,4 +248,315 @@ finish:
 	}
 	c.deferredMutex.Unlock()
 	return nil
+}
+
+func (c *Channel) Depth() int64 {
+	return int64(len(c.memoryMsgChan)) + c.backend.Depth()
+}
+
+func (c *Channel) Pause() error {
+	return c.doPause(true)
+}
+
+func (c *Channel) UnPause() error {
+	return c.doPause(false)
+}
+
+// doPause set pause flag to true and pause each client
+func (c *Channel) doPause(pause bool) error {
+	if pause {
+		atomic.StoreInt32(&c.paused, 1)
+	} else {
+		atomic.StoreInt32(&c.paused, 0)
+	}
+
+	c.RLock()
+	for _, client := range c.clients {
+		if pause {
+			client.Pause()
+		} else {
+			client.UnPause()
+		}
+	}
+	c.RUnlock()
+	return nil
+}
+
+func (c *Channel) IsPaused() bool {
+	// why need atomic to load int32 ?
+	// fluch cpu cache to memory ?
+	// it's a replacement of java volatile keyword
+	return atomic.LoadInt32(&c.paused) == 1
+}
+
+func (c *Channel) PutMessage(m *Message) error {
+	c.RLock()
+	defer c.RUnlock()
+	if c.Exiting() {
+		return errors.New("exiting")
+	}
+	err := c.put(m)
+	if err != nil {
+		return err
+	}
+	atomic.AddUint64(&c.messageCount, 1)
+	return nil
+}
+
+func (c *Channel) put(m *Message) error {
+	select {
+	case c.memoryMsgChan <- m:
+	default:
+		b := bufferPoolGet()
+		err := writeMessageToBackend(b, m, c.backend)
+		bufferPoolPut(b)
+		c.ctx.nsqd.SetHealth(err)
+		if err != nil {
+			c.ctx.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to write message to backend - %s",
+				c.name, err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
+	atomic.AddUint64(&c.messageCount, 1)
+	c.StartDeferredTimeout(msg, timeout)
+}
+
+func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
+	absTs := time.Now().Add(timeout).UnixNano()
+	item := &pqueue.Item{Value: msg, Priority: absTs}
+	err := c.pushDeferredMessage(item)
+	if err != nil {
+		return err
+	}
+	c.addToDeferredPQ(item)
+	return nil
+}
+
+func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
+	c.deferredMutex.Lock()
+
+	id := item.Value.(*Message).ID
+	_, ok := c.deferedMessages[id]
+	if ok {
+		c.deferredMutex.Unlock()
+		return errors.New("ID already deferred")
+	}
+	c.deferedMessages[id] = item
+	c.deferredMutex.Unlock()
+	return nil
+}
+
+func (c *Channel) popDeferredMessage(id MessageID) (*pqueue.Item, error) {
+	c.deferredMutex.Lock()
+	defer c.deferredMutex.Unlock()
+	item, ok := c.deferedMessages[id]
+	if !ok {
+		return nil, errors.New("ID not deferred")
+	}
+	delete(c.deferedMessages, id)
+	return item, nil
+}
+
+func (c *Channel) addToDeferredPQ(item *pqueue.Item) {
+	c.deferredMutex.Lock()
+	heap.Push(&c.deferedPQ, item)
+	c.deferredMutex.Unlock()
+}
+
+// pushInFlightMessage atomically adds a message to the in-flight dictionary
+func (c *Channel) pushInFlightMessage(msg *Message) error {
+	c.inFlightMutex.Lock()
+	defer c.inFlightMutex.Unlock()
+	_, ok := c.inFlightMessages[msg.ID]
+	if ok {
+		c.inFlightMutex.Unlock()
+		return errors.New("ID already in flight")
+	}
+	c.inFlightMessages[msg.ID] = msg
+	return nil
+}
+
+// popInflightMessage atomically removes a message from the in-flight dictionary
+func (c *Channel) popInFlightMessage(clientID int64, id MessageID) (*Message, error) {
+	c.inFlightMutex.Lock()
+	defer c.inFlightMutex.Unlock()
+	msg, ok := c.inFlightMessages[id]
+	if !ok {
+		return nil, errors.New("ID not in flight")
+	}
+	if msg.clientID != clientID {
+		return nil, errors.New("client does not own message")
+	}
+	delete(c.inFlightMessages, id)
+	return msg, nil
+}
+
+func (c *Channel) addToInFlightPQ(msg *Message) {
+	c.inFlightMutex.Lock()
+	c.inFlightPQ.Push(msg)
+	c.inFlightMutex.Unlock()
+}
+
+func (c *Channel) removeFromInFlightPQ(msg *Message) {
+	c.inFlightMutex.Lock()
+	defer c.inFlightMutex.Unlock()
+	if msg.index == -1 {
+		// this item has already been poped off the pqueue
+		return
+	}
+	c.inFlightPQ.Remove(msg.index)
+}
+
+// TouchMessage resets the timeout for an in-flight message
+func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout time.Duration) error {
+	msg, err := c.popInFlightMessage(clientID, id)
+	if err != nil {
+		return err
+	}
+	c.removeFromInFlightPQ(msg)
+
+	newTimeout := time.Now().Add(clientMsgTimeout)
+	if newTimeout.Sub(msg.deliveryTS) >= c.ctx.nsqd.getOpts().MaxMsgTimeout {
+		newTimeout = msg.deliveryTS.Add(c.ctx.nsqd.getOpts().MaxMsgTimeout)
+	}
+
+	msg.pri = newTimeout.UnixNano()
+	err = c.pushInFlightMessage(msg)
+	if err != nil {
+		return err
+	}
+	c.addToInFlightPQ(msg)
+	return nil
+}
+
+// FinishMessage successfully discards an in-flight message
+func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
+	msg, err := c.popInFlightMessage(clientID, id)
+	if err != nil {
+		return err
+	}
+	c.removeFromInFlightPQ(msg)
+	if c.e2eProcessingLatencyStream != nil {
+		c.e2eProcessingLatencyStream.Insert(msg.Timestamp)
+	}
+	return nil
+}
+
+// RequeueMessage requeues a message base on `time.Duration`, ie:
+//
+// `timeoutMs` == 0 - requeue a message immediately
+// `timeoutMs` > 0  - asynchronnously wait for the specified timeout
+//     and requeue a message (aka "deferred requeue")
+func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Duration) error {
+	msg, err := c.popInFlightMessage(clientID, id)
+	if err != nil {
+		return err
+	}
+	c.removeFromInFlightPQ(msg)
+	atomic.AddUint64(&c.requeueCount, 1)
+
+	if timeout == 0 {
+		c.exitMutex.RLock()
+		if c.Exiting() {
+			c.exitMutex.RUnlock()
+			return errors.New("exiting")
+		}
+		err := c.put(msg)
+		c.exitMutex.RUnlock()
+		return err
+	}
+
+	// deferred requeue
+	return c.StartDeferredTimeout(msg, timeout)
+}
+
+// AddClient adds a client to the Channel's client list
+func (c *Channel) AddClient(clientID int64, client Consumer) {
+	c.Lock()
+	defer c.Unlock()
+
+	_, ok := c.clients[clientID]
+	if ok {
+		return
+	}
+	c.clients[clientID] = client
+}
+
+// RemoveClient removes a client from Channel's client list
+func (c *Channel) RemoveClient(clientID int64) {
+	c.Lock()
+	defer c.Unlock()
+
+	_, ok := c.clients[clientID]
+	if !ok {
+		return
+	}
+	delete(c.clients, clientID)
+
+	if len(c.clients) == 0 && c.ephemeral == true {
+		go c.deleter.Do(func() { c.deleteCallback(c) })
+	}
+}
+
+func (c *Channel) processDeferredQueue(t int64) bool {
+	c.exitMutex.RLock()
+	defer c.exitMutex.RUnlock()
+
+	if c.Exiting() {
+		return false
+	}
+
+	dirty := false
+
+	for {
+		c.deferredMutex.Lock()
+		item, _ := c.deferedPQ.PeekAndShift(t)
+		c.deferredMutex.Unlock()
+
+		if item == nil {
+			goto exit
+		}
+		dirty = true
+		msg := item.Value.(*Message)
+		_, err := c.popDeferredMessage(msg.ID)
+		if err != nil {
+			goto exit
+		}
+		c.put(msg)
+	}
+exit:
+	return dirty
+}
+
+func (c *Channel) processInFlightQueue(t int64) bool {
+	c.exitMutex.Lock()
+	defer c.exitMutex.Unlock()
+	if c.Exiting() {
+		return false
+	}
+
+	dirty := false
+	for {
+		c.inFlightMutex.Lock()
+		msg, _ := c.inFlightPQ.PeekAndShift(t)
+		c.inFlightMutex.Unlock()
+		if msg == nil {
+			goto exit
+		}
+		dirty := false
+		atomic.AddUint64(&c.timeoutCount, 1)
+		c.RLock()
+		client, ok := c.clients[msg.clientID]
+		c.RUnlock()
+		if ok {
+			client.TimedOutMessage()
+		}
+		c.put(msg)
+	}
+exit:
+	return dirty
 }
