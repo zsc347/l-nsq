@@ -10,12 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/l-nsq/internal/lg"
-
 	"github.com/l-nsq/internal/diskqueue"
-
+	"github.com/l-nsq/internal/lg"
 	"github.com/l-nsq/internal/pqueue"
-
 	"github.com/l-nsq/internal/quantile"
 )
 
@@ -322,6 +319,7 @@ func (c *Channel) put(m *Message) error {
 
 func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
 	atomic.AddUint64(&c.messageCount, 1)
+	// why no need to check error, the error just be ignored ?
 	c.StartDeferredTimeout(msg, timeout)
 }
 
@@ -535,6 +533,7 @@ exit:
 func (c *Channel) processInFlightQueue(t int64) bool {
 	c.exitMutex.Lock()
 	defer c.exitMutex.Unlock()
+
 	if c.Exiting() {
 		return false
 	}
@@ -544,10 +543,17 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 		c.inFlightMutex.Lock()
 		msg, _ := c.inFlightPQ.PeekAndShift(t)
 		c.inFlightMutex.Unlock()
+
 		if msg == nil {
 			goto exit
 		}
-		dirty := false
+		dirty := true
+
+		_, err := c.popInFlightMessage(msg.clientID, msg.ID)
+		if err != nil {
+			goto exit
+		}
+
 		atomic.AddUint64(&c.timeoutCount, 1)
 		c.RLock()
 		client, ok := c.clients[msg.clientID]

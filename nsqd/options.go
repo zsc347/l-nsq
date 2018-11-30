@@ -7,6 +7,7 @@ import (
 )
 
 type Options struct {
+	ID       int64 `flag:"node-id" cfg:"id"`
 	Logger   Logger
 	logLevel lg.LogLevel // private, not really an option
 
