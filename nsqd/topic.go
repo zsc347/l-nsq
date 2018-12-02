@@ -1,10 +1,14 @@
 package nsqd
 
 import (
+	"bytes"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/l-nsq/internal/quantile"
 
 	"github.com/l-nsq/internal/lg"
 
@@ -13,6 +17,7 @@ import (
 	"github.com/l-nsq/internal/util"
 )
 
+// Topic describes topic struct
 type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	messageCount uint64
@@ -40,7 +45,7 @@ type Topic struct {
 	ctx *context
 }
 
-// Topic constructor
+// NewTopic is Topic constructor
 func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topic {
 	t := &Topic{
 		name:              topicName,
@@ -179,10 +184,145 @@ exit:
 	t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): closing ... messagePump", t.name)
 }
 
+// Start starts a topic
+func (t *Topic) Start() {
+	select {
+	case t.startChan <- 1:
+	default:
+	}
+}
+
+// Exiting returns a boolean indecating if this topic is closed/exiting
+func (t *Topic) Exiting() bool {
+	return atomic.LoadInt32(&t.exitFlag) == 1
+}
+
+// GetChannel performs a thread safe operation
+// to return a pointer to a Channel object (potentially new)
+// for the given Topic
+func (t *Topic) GetChannel(channelName string) *Channel {
+	t.Lock()
+	channel, isNew := t.getOrCreateChannel(channelName)
+	t.Unlock()
+
+	if isNew {
+		// update messagePump state
+		select {
+		case t.channelUpdateChan <- 1:
+		case <-t.exitChan:
+		}
+	}
+
+	return channel
+}
+
+// this expects the caller to handle locking
+func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
+	channel, ok := t.channelMap[channelName]
+	if !ok {
+		deleteCallback := func(c *Channel) {
+			t.DeleteExistingChannel(c.name)
+		}
+		channel = NewChannel(t.name, channelName, t.ctx, deleteCallback)
+		t.channelMap[channelName] = channel
+		t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): new channel(%s)", t.name, channel.name)
+		return channel, true
+	}
+	return channel, false
+}
+
+// DeleteExistingChannel removes a channel from the topic only if it exists
+func (t *Topic) DeleteExistingChannel(channelName string) error {
+	t.Lock()
+	channel, ok := t.channelMap[channelName]
+	if !ok {
+		t.Unlock()
+		return errors.New("channel does not exist")
+	}
+	delete(t.channelMap, channelName)
+
+	// not deferred so that we can continue while the channel async closes
+	numChanels := len(t.channelMap)
+	t.Unlock()
+
+	t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): deleting channel %s", t.name, channel.name)
+
+	// delete empties the channel before closing
+	// (so that we dont leave any messages around)
+	channel.Delete()
+
+	// update messagePump state
+	select {
+	case t.channelUpdateChan <- 1:
+	case <-t.exitChan:
+	}
+
+	if numChanels == 0 && t.ephemeral == true {
+		go t.deleter.Do(func() { t.deleteCallback(t) })
+	}
+	return nil
+}
+
+// PutMessage writes a Message to the queue
+func (t *Topic) PutMessage(m *Message) error {
+	t.RLock()
+	defer t.RUnlock()
+	if atomic.LoadInt32(&t.exitFlag) == 1 {
+		return errors.New("exiting")
+	}
+	err := t.put(m)
+	if err != nil {
+		return err
+	}
+	atomic.AddUint64(&t.messageCount, 1)
+	return nil
+}
+
+// PutMessages writes multiple Messages to the queue
+func (t *Topic) PutMessages(msgs []*Message) error {
+	t.RLock()
+	defer t.RUnlock()
+	if atomic.LoadInt32(&t.exitFlag) == 1 {
+		return errors.New("exiting")
+	}
+	for _, m := range msgs {
+		err := t.put(m)
+		if err != nil {
+			return err
+		}
+	}
+	atomic.AddUint64(&t.messageCount, uint64(len(msgs)))
+	return nil
+}
+
+func (t *Topic) put(m *Message) error {
+	select {
+	case t.memoryMsgChan <- m:
+	default:
+		b := bufferPoolGet()
+		err := writeMessageToBackend(b, m, t.backend)
+		bufferPoolPut(b)
+		t.ctx.nsqd.SetHealth(err)
+		if err != nil {
+			t.ctx.nsqd.logf(LOG_ERROR,
+				"TOPIC(%s) ERROR: failed to write message to backend - %s",
+				t.name, err)
+		}
+	}
+	return nil
+}
+
+// Depth return current msg length of topic
+func (t *Topic) Depth() int64 {
+	return int64(len(t.memoryMsgChan)) + t.backend.Depth()
+}
+
+// Pause pause chanel
 func (t *Topic) Pause() error {
 	return t.doPause(true)
 }
 
+// UnPause unpause channel
 func (t *Topic) UnPause() error {
 	return t.doPause(false)
 }
@@ -215,4 +355,123 @@ retry:
 		goto retry
 	}
 	return id.Hex()
+}
+
+// Delete empties the topic and all its channels and closes
+func (t *Topic) Delete() error {
+	return t.exit(true)
+}
+
+// Close persists all outstanding topic data and closes all its channels
+func (t *Topic) Close() error {
+	return t.exit(false)
+}
+
+func (t *Topic) exit(deleted bool) error {
+	if !atomic.CompareAndSwapInt32(&t.exitFlag, 0, 1) {
+		return errors.New("exiting")
+	}
+
+	if deleted {
+		t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): deleting", t.name)
+
+		// since we are explicityly deleting a topic (not just at system exit time)
+		// do-register this from the lookupd
+		t.ctx.nsqd.Notify(t)
+	} else {
+		t.ctx.nsqd.logf(LOG_INFO, "TOPIC(%s): closing", t.name)
+	}
+	close(t.exitChan)
+
+	// synchronize the close of messagePump()
+	t.waitGroup.Wait()
+
+	if deleted {
+		t.Lock()
+		for _, channel := range t.channelMap {
+			delete(t.channelMap, channel.name)
+			channel.Delete()
+		}
+		t.Unlock()
+		t.Empty()
+		return t.backend.Delete()
+	}
+
+	// why read channel map here no need to lock topic ?
+
+	// close all the channels
+	for _, channel := range t.channelMap {
+		err := channel.Close()
+		if err != nil {
+			// we need to continue regardless of error to close all the channels
+			t.ctx.nsqd.logf(LOG_ERROR, "channel(%s) close - %s", channel.name, err)
+		}
+	}
+
+	// why not check flush error here ?
+
+	// write anything leftover to disk
+	t.flush()
+	return t.backend.Close()
+}
+
+// Empty clears all topic message both in memory and in backend queue
+func (t *Topic) Empty() error {
+	for {
+		select {
+		case <-t.memoryMsgChan:
+		default:
+			goto finish
+		}
+	}
+
+finish:
+	return t.backend.Empty()
+}
+
+func (t *Topic) flush() error {
+	var msgBuf bytes.Buffer
+
+	if len(t.memoryMsgChan) > 0 {
+		t.ctx.nsqd.logf(LOG_INFO,
+			"TOPIC(%s): flushing %d memory messages to backend", t.name, len(t.memoryMsgChan))
+	}
+	for {
+		select {
+		case msg := <-t.memoryMsgChan:
+			err := writeMessageToBackend(&msgBuf, msg, t.backend)
+			if err != nil {
+				t.ctx.nsqd.logf(LOG_ERROR,
+					"ERROR: failed to write message to backend - %s", err)
+			}
+		default:
+			goto finish
+		}
+	}
+finish:
+	return nil
+}
+
+func (t *Topic) AggregateChannelE2eProcessingLatency() *quantile.Quantile {
+	var latencyStream *quantile.Quantile
+	t.RLock()
+	realChannels := make([]*Channel, 0, len(t.channelMap))
+
+	for _, c := range t.channelMap {
+		realChannels = append(realChannels, c)
+	}
+	t.RUnlock()
+
+	for _, c := range realChannels {
+		if c.e2eProcessingLatencyStream == nil {
+			continue
+		}
+		if latencyStream == nil {
+			latencyStream = quantile.New(
+				t.ctx.nsqd.getOpts().E2EProcessingLatencyWindowTime,
+				t.ctx.nsqd.getOpts().E2EProcessingLatencyPercentiles)
+		}
+		latencyStream.Merge(c.e2eProcessingLatencyStream)
+	}
+	return latencyStream
 }
