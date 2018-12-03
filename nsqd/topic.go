@@ -452,6 +452,7 @@ finish:
 	return nil
 }
 
+// AggregateChannelE2eProcessingLatency aggregates processing latency for topic
 func (t *Topic) AggregateChannelE2eProcessingLatency() *quantile.Quantile {
 	var latencyStream *quantile.Quantile
 	t.RLock()
