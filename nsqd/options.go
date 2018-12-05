@@ -12,6 +12,10 @@ type Options struct {
 	Logger   Logger
 	logLevel lg.LogLevel // private, not really an option
 
+	AuthHTTPAddresses           []string      `falg:"auth-http-address" cfg:"nsqlookupd_tcp_address"`
+	HTTPClientConnectionTimeout time.Duration `flag:"http-client-connec-timeout" cfg:"http_client_connect_timeout"`
+	HTTPClientRequestTimeout    time.Duration `flag:"http-client-request-timeout" cfg:"http_client_request_timeout"`
+
 	DataPath        string        `flag:"data-path"`
 	MemQueueSize    int64         `flag:"mem-queue-size"`
 	MaxBytesPerFile int64         `flag:"max-bytes-per-file"`

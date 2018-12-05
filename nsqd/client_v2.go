@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/golang/snappy"
+
 	"github.com/l-nsq/internal/auth"
 )
 
@@ -352,6 +354,13 @@ func (c *clientV2) Stats() ClientStats {
 	return stats
 }
 
+func (c *clientV2) IsProducer() bool {
+	c.metaLock.RLock()
+	retval := len(c.pubCounts) > 0
+	c.metaLock.RUnlock()
+	return retval
+}
+
 type prettyConnectionState struct {
 	tls.ConnectionState
 }
@@ -417,6 +426,214 @@ func (p *prettyConnectionState) GetVersion() string {
 	default:
 		return fmt.Sprintf("Unknown %d", p.Version)
 	}
+}
+
+func (c *clientV2) IsReadyForMessages() bool {
+	if c.Channel.IsPaused() {
+		return false
+	}
+
+	readyCount := atomic.LoadInt64(&c.ReadyCount)
+	inFlightCount := atomic.LoadInt64(&c.InFlightCount)
+
+	c.ctx.nsqd.logf(LOG_DEBUG, "[%s] state rdy: %4d inFlight %4d",
+		c, readyCount, inFlightCount)
+
+	// will inFlightCount < 0 ? why need check readCount <=0 ?
+	// seems it's possible, because -1 may run before +1
+	if inFlightCount >= readyCount || readyCount <= 0 {
+		return false
+	}
+
+	return true
+}
+
+func (c *clientV2) SetReadyCount(count int64) {
+	atomic.StoreInt64(&c.ReadyCount, count)
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) tryUpdateReadyState() {
+	// you can always *try* to write to ReadyStateChan because in the case
+	// where you cannot the message pump loop wold have iterated anyway
+	// the atomic integer operations guarantee correcness of the value
+	select {
+	case c.ReadyStateChan <- 1:
+	default:
+	}
+}
+
+func (c *clientV2) FinishedMessage() {
+	atomic.AddUint64(&c.FinishCount, 1)
+	atomic.AddInt64(&c.InFlightCount, -1)
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) Empty() {
+	atomic.StoreInt64(&c.InFlightCount, 0)
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) SendingMessage() {
+	atomic.AddInt64(&c.InFlightCount, 1)
+	atomic.AddUint64(&c.MessageCount, 1)
+}
+
+func (c *clientV2) PublishedMessage(topic string, count uint64) {
+	c.metaLock.Lock()
+	c.pubCounts[topic] += count
+	c.metaLock.Unlock()
+}
+
+func (c *clientV2) TimedOutMessage() {
+	atomic.AddInt64(&c.InFlightCount, -1)
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) RequeuedMessage() {
+	atomic.AddUint64(&c.RequeueCount, 1)
+	atomic.AddInt64(&c.InFlightCount, -1)
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) StartClose() {
+	// Force the client into ready 0
+	c.SetReadyCount(0)
+	// mark this client as closing
+	atomic.StoreInt32(&c.State, stateClosing)
+}
+
+func (c *clientV2) Pause() {
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) UnPause() {
+	c.tryUpdateReadyState()
+}
+
+func (c *clientV2) UpgradeTLS() error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	// why client use tls.Server ?
+	tlsConn := tls.Server(c.Conn, c.ctx.nsqd.tlsConfig)
+	tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	err := tlsConn.Handshake()
+	if err != nil {
+		return err
+	}
+	c.tlsConn = tlsConn
+
+	c.Reader = bufio.NewReaderSize(c.tlsConn, defaultBufferSize)
+	c.Writer = bufio.NewWriterSize(c.tlsConn, c.OutputBufferSize)
+
+	atomic.StoreInt32(&c.TLS, 1)
+	return nil
+}
+
+func (c *clientV2) UpgradeDeflate(level int) error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	conn := c.Conn
+	if c.tlsConn != nil {
+		conn = c.tlsConn
+	}
+
+	c.Reader = bufio.NewReaderSize(flate.NewReader(conn), defaultBufferSize)
+
+	fw, _ := flate.NewWriter(conn, level)
+	c.flateWriter = fw
+	c.Writer = bufio.NewWriterSize(fw, c.OutputBufferSize)
+
+	atomic.StoreInt32(&c.Deflate, 1)
+
+	return nil
+}
+
+func (c *clientV2) UpgradeSnappy(level int) error {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+
+	conn := c.Conn
+	if c.tlsConn != nil {
+		conn = c.tlsConn
+	}
+
+	c.Reader = bufio.NewReaderSize(snappy.NewReader(conn), defaultBufferSize)
+	c.Writer = bufio.NewWriterSize(snappy.NewWriter(conn), c.OutputBufferSize)
+
+	atomic.StoreInt32(&c.Snappy, 1)
+	return nil
+}
+
+func (c *clientV2) Flush() error {
+	var zeroTime time.Time
+	if c.HeartbeatInterval > 0 {
+		c.SetWriteDeadline(time.Now().Add(c.HeartbeatInterval))
+	} else {
+		c.SetWriteDeadline(zeroTime)
+	}
+
+	err := c.Writer.Flush()
+	if err != nil {
+		return err
+	}
+
+	if c.flateWriter != nil {
+		return c.flateWriter.Flush()
+	}
+
+	return nil
+}
+
+func (c *clientV2) QueryAuthd() error {
+	remoteIP, _, err := net.SplitHostPort(c.String())
+	if err != nil {
+		return err
+	}
+
+	tls := atomic.LoadInt32(&c.TLS) == 1
+	tlsEnabled := "false"
+	if tls {
+		tlsEnabled = "true"
+	}
+
+	authState, err := auth.QueryAnyAuthd(c.ctx.nsqd.getOpts().AuthHTTPAddresses,
+		remoteIP, tlsEnabled, c.AuthSecreat,
+		c.ctx.nsqd.getOpts().HTTPClientConnectionTimeout,
+		c.ctx.nsqd.getOpts().HTTPClientRequestTimeout)
+
+	if err != nil {
+		return err
+	}
+	c.AuthState = authState
+	return nil
+}
+
+func (c *clientV2) Auth(secret string) error {
+	c.AuthSecreat = secret
+	return c.QueryAuthd()
+}
+
+func (c *clientV2) IsAuthorized(topic, channel string) (bool, error) {
+	if c.AuthState == nil {
+		return false, nil
+	}
+
+	if c.AuthState.IsExpired() {
+		err := c.QueryAuthd()
+		if err != nil {
+			return false, err
+		}
+	}
+
+	if c.AuthState.IsAllowed(topic, channel) {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (c *clientV2) HasAuthorizations() bool {

@@ -1,6 +1,7 @@
 package nsqd
 
 import (
+	"crypto/tls"
 	"sync"
 	"sync/atomic"
 
@@ -20,6 +21,8 @@ type NSQD struct {
 
 	clientLock sync.RWMutex
 	clients    map[int64]Client
+
+	tlsConfig *tls.Config
 
 	waitGroup util.WaitGroupWrapper
 
