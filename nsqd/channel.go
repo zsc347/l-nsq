@@ -547,8 +547,8 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 		if msg == nil {
 			goto exit
 		}
-		dirty := true
 
+		dirty = true
 		_, err := c.popInFlightMessage(msg.clientID, msg.ID)
 		if err != nil {
 			goto exit
