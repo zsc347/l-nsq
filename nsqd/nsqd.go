@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/l-nsq/internal/clusterinfo"
+	"github.com/l-nsq/internal/lg"
 	"github.com/l-nsq/internal/util"
 )
 
@@ -18,6 +19,7 @@ type errStore struct {
 	err error
 }
 
+// NSQD defined nsqd context structure
 type NSQD struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit paltforms
 	clientIDSequence int64
@@ -54,6 +56,7 @@ func (n *NSQD) getOpts() *Options {
 	return n.opts.Load().(*Options)
 }
 
+// Notify allow chanel or topic to notify nsqd instance
 func (n *NSQD) Notify(v interface{}) {
 	// since the in-memory metadata is incomplete
 	// shoud not persist metadata while loading it.
@@ -70,27 +73,31 @@ func (n *NSQD) Notify(v interface{}) {
 			n.Lock()
 			err := n.PersistMetadata()
 			if err != nil {
-				n.logf(LOG_ERROR, "failed to persist metadata - %s", err)
+				n.logf(lg.ERROR, "failed to persist metadata - %s", err)
 			}
 			n.Unlock()
 		}
 	})
 }
 
+// PersistMetadata persist nsqd metadata
 func (n *NSQD) PersistMetadata() error {
 	// TODO
-	return nil
+	panic("NOT IMPLEMENTED")
 }
 
+// SetHealth set error
 func (n *NSQD) SetHealth(err error) {
 	n.errValue.Store(errStore{err: err})
 }
 
+// GetError return nsqd error
 func (n *NSQD) GetError() error {
 	errValue := n.errValue.Load()
 	return errValue.(errStore).err
 }
 
+// GetHealth tells wheter nsqd is in a goog state, OK or NOK
 func (n *NSQD) GetHealth() string {
 	err := n.GetError()
 	if err != nil {
@@ -99,22 +106,27 @@ func (n *NSQD) GetHealth() string {
 	return "OK"
 }
 
+// IsHealthy return whether error occured
 func (n *NSQD) IsHealthy() bool {
 	return n.GetError() == nil
 }
 
+// RealTCPAddr return real tcp address
 func (n *NSQD) RealTCPAddr() *net.TCPAddr {
 	return n.tcpListener.Addr().(*net.TCPAddr)
 }
 
+// RealHTTPAddr retrun real http address
 func (n *NSQD) RealHTTPAddr() *net.TCPAddr {
 	return n.httpListener.Addr().(*net.TCPAddr)
 }
 
+// GetStartTime return nsqd start time
 func (n *NSQD) GetStartTime() time.Time {
 	return n.startTime
 }
 
+// Client is an interface for nsqd client
 type Client interface {
 	Stats() ClientStats
 	IsProducer() bool
@@ -145,7 +157,7 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	n.topicMap[topicName] = t
 	n.Unlock()
 
-	n.logf(LOG_INFO, "TOPIC(%s): created", t.name)
+	n.logf(lg.INFO, "TOPIC(%s): created", t.name)
 
 	// topic is created but messagePump not yet started
 
@@ -160,7 +172,7 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 	if len(lookupdHTTPAddrs) > 0 {
 		channelNames, err := n.ci.GetLookupdTopicChannels(t.name, lookupdHTTPAddrs)
 		if err != nil {
-			n.logf(LOG_WARN, "failed to query nsqlookupd for channels to pre-create for topic %s - %s", t.name, err)
+			n.logf(lg.WARN, "failed to query nsqlookupd for channels to pre-create for topic %s - %s", t.name, err)
 		}
 
 		for _, channelName := range channelNames {
@@ -170,7 +182,7 @@ func (n *NSQD) GetTopic(topicName string) *Topic {
 			t.GetChannel(channelName)
 		}
 	} else if len(n.getOpts().NSQLookupdTCPAddress) > 0 {
-		n.logf(LOG_ERROR, "no available nsqlookupd to query for channels to pre-creqte for topic %s", t.name)
+		n.logf(lg.ERROR, "no available nsqlookupd to query for channels to pre-creqte for topic %s", t.name)
 	}
 
 	// now that all channels are added, start topic messagePump

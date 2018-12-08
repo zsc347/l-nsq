@@ -3,10 +3,12 @@ package nsqd
 import (
 	"runtime"
 	"sort"
+	"sync/atomic"
 
 	"github.com/l-nsq/internal/quantile"
 )
 
+// TopicStats define topic stats
 type TopicStats struct {
 	TopicName            string           `json:"topic_name"`
 	Channels             []ChannelStats   `json:"channels"`
@@ -17,6 +19,21 @@ type TopicStats struct {
 	E2eProcessingLatency *quantile.Result `json:"e2d_processing_latency"`
 }
 
+// NewTopicStats construct TopicStats
+func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
+	return TopicStats{
+		TopicName:    t.name,
+		Channels:     channels,
+		Depth:        t.Depth(),
+		BackendDepth: t.backend.Depth(),
+		MessageCount: atomic.LoadUint64(&t.messageCount),
+		Paused:       t.IsPaused(),
+
+		E2eProcessingLatency: t.AggregateChannelE2eProcessingLatency().Result(),
+	}
+}
+
+// ChannelStats define channelStats
 type ChannelStats struct {
 	ChannelName          string           `json:"channel_name"`
 	Depth                int64            `json:"depth"`
@@ -31,11 +48,37 @@ type ChannelStats struct {
 	E2eProcessingLatency *quantile.Result `json:"e2e_processing_latency"`
 }
 
+// NewChannelStats return channel stats
+func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
+	c.inFlightMutex.Lock()
+	inflight := len(c.inFlightMessages)
+	c.inFlightMutex.Unlock()
+	c.deferredMutex.Lock()
+	deferred := len(c.deferedMessages)
+	c.deferredMutex.Unlock()
+
+	return ChannelStats{
+		ChannelName:          c.name,
+		Depth:                c.Depth(),
+		BackendDepth:         c.backend.Depth(),
+		InFlightCount:        inflight,
+		DeferredCount:        deferred,
+		MessageCount:         atomic.LoadUint64(&c.messageCount),
+		RequeueCount:         atomic.LoadUint64(&c.requeueCount),
+		TimeoutCount:         atomic.LoadUint64(&c.timeoutCount),
+		Clients:              clients,
+		Paused:               c.IsPaused(),
+		E2eProcessingLatency: c.e2eProcessingLatencyStream.Result(),
+	}
+}
+
+// PubCount tell count of messages published by topic
 type PubCount struct {
 	Topic string `json:"topic"`
 	Count uint64 `json:"count"`
 }
 
+// ClientStats define statistics structure
 type ClientStats struct {
 	ClientID        string `json:"client_id"`
 	Hostname        string `json:"hostname"`
@@ -74,9 +117,97 @@ type memStats struct {
 	GCPauseUsec99     uint64 `json:"gc_pause_usec_99"`
 	GCPauseUsec95     uint64 `json:"gc_pause_usec_95"`
 	NextGCBytes       uint64 `json:"next_gc_bytes"`
-	GCToTalRuns       uint32 `json:"gc_total_runs"`
+	GCTotalRuns       uint32 `json:"gc_total_runs"`
 }
 
+// Topics define slice of Topic
+type Topics []*Topic
+
+// Len return length of topics
+func (t Topics) Len() int { return len(t) }
+
+// Swap swap element in Topics
+func (t Topics) Swap(i, j int) { t[i], t[j] = t[j], t[i] }
+
+// TopicsByName support sort topics by name
+type TopicsByName struct {
+	Topics
+}
+
+// Less compare topic by name
+func (t TopicsByName) Less(i, j int) bool { return t.Topics[i].name < t.Topics[j].name }
+
+// Channels define slice of Channel
+type Channels []*Channel
+
+// Len return length of Channels
+func (c Channels) Len() int { return len(c) }
+
+// Swap swap element
+func (c Channels) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
+
+// ChannelsByName support sort channels by name
+type ChannelsByName struct {
+	Channels
+}
+
+// Less compare by channel name
+func (c ChannelsByName) Less(i, j int) bool {
+	return c.Channels[i].name < c.Channels[j].name
+}
+
+// GetStats return topic stats
+func (n *NSQD) GetStats(topic string, channel string) []TopicStats {
+	n.RLock()
+	var realTopics []*Topic
+	if topic == "" { // empty string means get all topic
+		realTopics = make([]*Topic, 0, len(n.topicMap))
+		for _, t := range n.topicMap {
+			realTopics = append(realTopics, t)
+		}
+	} else if val, exists := n.topicMap[topic]; exists {
+		realTopics = []*Topic{val}
+	} else { // nil do nothing, return empty list
+		n.RUnlock()
+		return []TopicStats{}
+	}
+	n.Unlock()
+	sort.Sort(TopicsByName{realTopics})
+
+	topics := make([]TopicStats, 0, len(realTopics))
+	for _, t := range realTopics {
+		t.RLock()
+		var realChannels []*Channel
+		if channel == "" {
+			realChannels = make([]*Channel, 0, len(t.channelMap))
+			for _, c := range t.channelMap {
+				realChannels = append(realChannels, c)
+			}
+		} else if val, exists := t.channelMap[channel]; exists {
+			realChannels = []*Channel{val}
+		} else {
+			t.RUnlock()
+			continue
+		}
+		t.RUnlock()
+		sort.Sort(ChannelsByName{realChannels})
+
+		channels := make([]ChannelStats, 0, len(t.channelMap))
+		for _, c := range t.channelMap {
+			c.RLock()
+			clients := make([]ClientStats, 0, len(c.clients))
+			for _, client := range c.clients {
+				clients = append(clients, client.Stats())
+			}
+			c.RUnlock()
+			channels = append(channels, NewChannelStats(c, clients))
+		}
+		topics = append(topics, NewTopicStats(t, channels))
+	}
+	return topics
+}
+
+// GetProducerStats find producer and return stats
 func (n *NSQD) GetProducerStats() []ClientStats {
 	n.clientLock.RLock()
 	var producers []Client

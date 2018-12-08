@@ -18,8 +18,13 @@ const (
 	twepoch = int64(1288834974288)
 )
 
+// ErrTimeBackwards defined exception when guid detect system time backward
 var ErrTimeBackwards = errors.New("time has gone backwards")
+
+// ErrSequenceExpired tells too many message requested for a time slice
 var ErrSequenceExpired = errors.New("sequence expired")
+
+// ErrIDBackwards happens when current id is less than last id caused by concurrent
 var ErrIDBackwards = errors.New("ID went backward")
 
 type guid int64
@@ -33,7 +38,7 @@ type guidFactory struct {
 	lastID        guid
 }
 
-func NewGUIDFactory(nodeID int64) *guidFactory {
+func newGUIDFactory(nodeID int64) *guidFactory {
 	return &guidFactory{
 		nodeID: nodeID,
 	}

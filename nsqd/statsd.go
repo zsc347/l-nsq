@@ -4,6 +4,7 @@ import (
 	"math"
 )
 
+// Uint64Slice for sort uint64 slice
 type Uint64Slice []uint64
 
 func (s Uint64Slice) Len() int {

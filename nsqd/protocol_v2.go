@@ -1,6 +1,7 @@
 package nsqd
 
 import (
+	"io"
 	"net"
 )
 
@@ -16,6 +17,11 @@ var okBytes = []byte("OK")
 
 type protocolV2 struct {
 	ctx *context
+}
+
+func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBodySize int64) ([]*Message, error) {
+	// TODO
+	panic("NOT IMPLEMENT YET")
 }
 
 func (p *protocolV2) IOLoop(conn net.Conn) error {

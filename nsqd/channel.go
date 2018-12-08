@@ -16,6 +16,7 @@ import (
 	"github.com/l-nsq/internal/quantile"
 )
 
+// Consumer defined interface of channel consumer
 type Consumer interface {
 	UnPause()
 	Pause()
@@ -74,6 +75,7 @@ type Channel struct {
 	inFlightMutex    sync.Mutex
 }
 
+// NewChannel construct a new channel
 func NewChannel(topicName string, channelName string, ctx *context,
 	deleteCallback func(*Channel)) *Channel {
 
@@ -157,13 +159,13 @@ func (c *Channel) exit(deleted bool) error {
 	}
 
 	if deleted {
-		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): deleting", c.name)
+		c.ctx.nsqd.logf(lg.INFO, "CHANNEL(%s): deleting", c.name)
 
 		// since we are explicitly deleting a channel ( not just at system exit time)
 		// de-register this from the lookupd
 		c.ctx.nsqd.Notify(c)
 	} else {
-		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): closing", c.name)
+		c.ctx.nsqd.logf(lg.INFO, "CHANNEL(%s): closing", c.name)
 	}
 
 	// this forceably closes client connections
@@ -182,6 +184,7 @@ func (c *Channel) exit(deleted bool) error {
 	return c.backend.Close()
 }
 
+// Empty clean all channel messages
 func (c *Channel) Empty() error {
 	c.Lock()
 	defer c.Unlock()
@@ -210,7 +213,7 @@ func (c *Channel) flush() error {
 	var msgBuf bytes.Buffer
 
 	if len(c.memoryMsgChan) > 0 || len(c.inFlightMessages) > 0 || len(c.deferedMessages) > 0 {
-		c.ctx.nsqd.logf(LOG_INFO, "CHANNEL(%s): flushing %d memory %d in-flight %d defered messages to backend",
+		c.ctx.nsqd.logf(lg.INFO, "CHANNEL(%s): flushing %d memory %d in-flight %d defered messages to backend",
 			c.name, len(c.memoryMsgChan), len(c.inFlightMessages), len(c.deferedMessages))
 	}
 
@@ -219,7 +222,7 @@ func (c *Channel) flush() error {
 		case msg := <-c.memoryMsgChan:
 			err := writeMessageToBackend(&msgBuf, msg, c.backend)
 			if err != nil {
-				c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+				c.ctx.nsqd.logf(lg.ERROR, "failed to write message to backend - %s", err)
 			}
 		default:
 			goto finish
@@ -230,7 +233,7 @@ finish:
 	for _, msg := range c.inFlightMessages {
 		err := writeMessageToBackend(&msgBuf, msg, c.backend)
 		if err != nil {
-			c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+			c.ctx.nsqd.logf(lg.ERROR, "failed to write message to backend - %s", err)
 		}
 	}
 	c.inFlightMutex.Unlock()
@@ -240,21 +243,24 @@ finish:
 		msg := item.Value.(*Message)
 		err := writeMessageToBackend(&msgBuf, msg, c.backend)
 		if err != nil {
-			c.ctx.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+			c.ctx.nsqd.logf(lg.ERROR, "failed to write message to backend - %s", err)
 		}
 	}
 	c.deferredMutex.Unlock()
 	return nil
 }
 
+// Depth return channel message depth , include memory and backend queue
 func (c *Channel) Depth() int64 {
 	return int64(len(c.memoryMsgChan)) + c.backend.Depth()
 }
 
+// Pause pause channel
 func (c *Channel) Pause() error {
 	return c.doPause(true)
 }
 
+// UnPause resume channel
 func (c *Channel) UnPause() error {
 	return c.doPause(false)
 }
@@ -279,6 +285,7 @@ func (c *Channel) doPause(pause bool) error {
 	return nil
 }
 
+// IsPaused return whether channel is paused
 func (c *Channel) IsPaused() bool {
 	// why need atomic to load int32 ?
 	// fluch cpu cache to memory ?
@@ -286,6 +293,7 @@ func (c *Channel) IsPaused() bool {
 	return atomic.LoadInt32(&c.paused) == 1
 }
 
+// PutMessage put one message to channel
 func (c *Channel) PutMessage(m *Message) error {
 	c.RLock()
 	defer c.RUnlock()
@@ -309,7 +317,7 @@ func (c *Channel) put(m *Message) error {
 		bufferPoolPut(b)
 		c.ctx.nsqd.SetHealth(err)
 		if err != nil {
-			c.ctx.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to write message to backend - %s",
+			c.ctx.nsqd.logf(lg.ERROR, "CHANNEL(%s): failed to write message to backend - %s",
 				c.name, err)
 			return err
 		}
@@ -317,12 +325,14 @@ func (c *Channel) put(m *Message) error {
 	return nil
 }
 
+// PutMessageDeferred put a deferred message
 func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
 	atomic.AddUint64(&c.messageCount, 1)
 	// why no need to check error, the error just be ignored ?
 	c.StartDeferredTimeout(msg, timeout)
 }
 
+// StartDeferredTimeout add a message to deferred queue
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
 	absTs := time.Now().Add(timeout).UnixNano()
 	item := &pqueue.Item{Value: msg, Priority: absTs}

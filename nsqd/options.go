@@ -13,7 +13,7 @@ type Options struct {
 	logLevel lg.LogLevel // private, not really an option
 
 	BroadcastAddress     string   `flag:"broadcast-address"`
-	NSQLookupdTCPAddress []string `flag: "lookupd-tcp-address" cfg:"nsqlookupd_tcp_addresses"`
+	NSQLookupdTCPAddress []string `flag:"lookupd-tcp-address" cfg:"nsqlookupd_tcp_addresses"`
 
 	AuthHTTPAddresses           []string      `falg:"auth-http-address" cfg:"nsqlookupd_tcp_address"`
 	HTTPClientConnectionTimeout time.Duration `flag:"http-client-connec-timeout" cfg:"http_client_connect_timeout"`
@@ -32,6 +32,7 @@ type Options struct {
 	// msg and command options
 	MsgTimeout    time.Duration `flag:"msg-timeout"`
 	MaxMsgSize    int64         `flag:"max-msg-size"`
+	MaxBodySize   int64         `flag:"max-body-size"`
 	MaxReqTimeout time.Duration `flag:"max-req-timeout"`
 	ClientTimeout time.Duration
 

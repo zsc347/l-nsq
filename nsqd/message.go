@@ -9,12 +9,15 @@ import (
 )
 
 const (
+	// MsgIDLength bytes length
 	MsgIDLength       = 16
 	minValidMsgLength = MsgIDLength + 8 + 2 // Timestamp + Attempts
 )
 
+// MessageID defined id for Message type
 type MessageID [MsgIDLength]byte
 
+// Message defined message structure
 type Message struct {
 	ID        MessageID
 	Body      []byte
@@ -29,6 +32,7 @@ type Message struct {
 	deferred   time.Duration
 }
 
+// NewMessage construct a new message
 func NewMessage(id MessageID, body []byte) *Message {
 	return &Message{
 		ID:        id,
@@ -51,6 +55,7 @@ func decodeMessage(b []byte) (*Message, error) {
 	return &msg, nil
 }
 
+// WriteTo write message to writer
 func (m *Message) WriteTo(w io.Writer) (int64, error) {
 	var buf [10]byte
 	var total int64

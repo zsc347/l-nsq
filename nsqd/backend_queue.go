@@ -1,5 +1,6 @@
 package nsqd
 
+// BackendQueue defined interface of backend queue
 type BackendQueue interface {
 	Put([]byte) error
 	ReadChan() chan []byte

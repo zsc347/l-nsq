@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/l-nsq/internal/lg"
+
 	"github.com/golang/snappy"
 
 	"github.com/l-nsq/internal/auth"
@@ -157,7 +159,7 @@ func (c *clientV2) String() string {
 }
 
 func (c *clientV2) Identify(data identifyDataV2) error {
-	c.ctx.nsqd.logf(LOG_INFO, "[%s] IDENTIFY: %+v", c, data)
+	c.ctx.nsqd.logf(lg.INFO, "[%s] IDENTIFY: %+v", c, data)
 
 	c.metaLock.Lock()
 	c.ClientID = data.ClientID
@@ -436,7 +438,7 @@ func (c *clientV2) IsReadyForMessages() bool {
 	readyCount := atomic.LoadInt64(&c.ReadyCount)
 	inFlightCount := atomic.LoadInt64(&c.InFlightCount)
 
-	c.ctx.nsqd.logf(LOG_DEBUG, "[%s] state rdy: %4d inFlight %4d",
+	c.ctx.nsqd.logf(lg.DEBUG, "[%s] state rdy: %4d inFlight %4d",
 		c, readyCount, inFlightCount)
 
 	// will inFlightCount < 0 ? why need check readCount <=0 ?
