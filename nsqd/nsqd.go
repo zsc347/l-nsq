@@ -214,3 +214,15 @@ func (n *NSQD) DeleteExistingTopic(topicName string) error {
 
 	return nil
 }
+
+// GetExistingTopic gets a topic only if it exists
+func (n *NSQD) GetExistingTopic(topicName string) (*Topic, error) {
+	n.RLock()
+	defer n.RUnlock()
+
+	topic, ok := n.topicMap[topicName]
+	if !ok {
+		return nil, errors.New("topic does not exist")
+	}
+	return topic, nil
+}

@@ -8,7 +8,9 @@ import (
 
 // Options combines all nsqd configurable options
 type Options struct {
-	ID       int64 `flag:"node-id" cfg:"id"`
+	// basic options
+	ID       int64  `flag:"node-id" cfg:"id"`
+	LogLevel string `flag:"log-level"`
 	Logger   Logger
 	logLevel lg.LogLevel // private, not really an option
 

@@ -231,6 +231,17 @@ func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 	return channel, false
 }
 
+// GetExistingChannel assumes channel for channelName exist and return it
+func (t *Topic) GetExistingChannel(channelName string) (*Channel, error) {
+	t.RLock()
+	defer t.RUnlock()
+	channel, ok := t.channelMap[channelName]
+	if !ok {
+		return nil, errors.New("channel does not exist")
+	}
+	return channel, nil
+}
+
 // DeleteExistingChannel removes a channel from the topic only if it exists
 func (t *Topic) DeleteExistingChannel(channelName string) error {
 	t.Lock()

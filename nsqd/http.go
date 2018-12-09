@@ -3,13 +3,18 @@ package nsqd
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
+	"reflect"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/l-nsq/internal/lg"
@@ -61,7 +66,241 @@ func newHTTPServer(ctx *context, tlsEnabled bool, tlsRequired bool) *httpServer 
 	router.Handle("POST", "/mpub", http_api.Decorate(s.doMPUB, http_api.V1))
 	router.Handle("GET", "/stats", http_api.Decorate(s.doStats, log, http_api.V1))
 
+	// only v1
+	router.Handle("POST", "/topic/create", http_api.Decorate(s.doCreateTopic, log, http_api.V1))
+	router.Handle("POST", "/topic/delete", http_api.Decorate(s.doDeleteTopic, log, http_api.V1))
+	router.Handle("POST", "/topic/empty", http_api.Decorate(s.doEmptyChannel, log, http_api.V1))
+	router.Handle("POST", "/topic/pause", http_api.Decorate(s.doPauseTopic, log, http_api.V1))
+	router.Handle("POST", "/topic/unpause", http_api.Decorate(s.doPauseTopic, log, http_api.V1))
+
+	router.Handle("POST", "/channel/create", http_api.Decorate(s.doCreateChannel, log, http_api.V1))
+	router.Handle("POST", "/channel/delete", http_api.Decorate(s.doDeleteChannel, log, http_api.V1))
+	router.Handle("POST", "/channel/empty", http_api.Decorate(s.doEmptyChannel, log, http_api.V1))
+	router.Handle("POST", "/channel/pause", http_api.Decorate(s.doPauseChannel, log, http_api.V1))
+	router.Handle("POST", "/channel/unpause", http_api.Decorate(s.doPauseChannel, log, http_api.V1))
+
+	// debug
+	router.HandlerFunc("GET", "/debug/pprof", pprof.Index)
+	router.HandlerFunc("GET", "/debug/pprof/cmdline", pprof.Cmdline)
+	router.HandlerFunc("GET", "/debug/pprof/symbol", pprof.Symbol)
+	router.HandlerFunc("POST", "/debug/pprof/profile", pprof.Profile)
+
+	router.Handler("GET", "/debug/pprof/heap", pprof.Handler("heap"))
+	router.Handler("GET", "/debug/pprof/goroutine", pprof.Handler("goroutine"))
+	router.Handler("GET", "/debug/pprof/block", pprof.Handler("block"))
+	router.Handle("PUT", "/debug/setblockrate", http_api.Decorate(setBlockRateHandler, http_api.V1))
+	router.Handler("GET", "/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+
 	return s
+}
+
+func setBlockRateHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	rate, err := strconv.Atoi(req.FormValue("rate"))
+	if err != nil {
+		return nil, http_api.Err{Code: http.StatusBadRequest, Text: fmt.Sprintf("invalid block rate: %s", err.Error())}
+	}
+	runtime.SetBlockProfileRate(rate)
+	return nil, nil
+}
+
+func (s *httpServer) doCreateTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	_, _, err := s.getTopicFromQuery(req)
+	return nil, err
+}
+
+func (s *httpServer) doEmptyTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failed to parse request params - %s", err)
+		return nil, http_api.Err{Code: 400, Text: "INVALID_REQUEST"}
+	}
+
+	topicName, err := reqParams.Get("topic")
+	if err != nil {
+		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+	}
+
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, http_api.Err{Code: 400, Text: "INVALID_TOPIC"}
+	}
+
+	topic, err := s.ctx.nsqd.GetExistingTopic(topicName)
+	if err != nil {
+		return nil, http_api.Err{Code: 400, Text: "TOPIC_NOT_FOUND"}
+	}
+
+	err = topic.Empty()
+	if err != nil {
+		return nil, http_api.Err{Code: 500, Text: "INTERNAL_ERROR"}
+	}
+
+	return nil, nil
+}
+
+func (s *httpServer) doDeleteTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failed to parse request params - %s", err)
+	}
+
+	topicName, err := reqParams.Get("topic")
+	if err != nil {
+		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG__TOPIC"}
+	}
+
+	err = s.ctx.nsqd.DeleteExistingTopic(topicName)
+	if err != nil {
+		return nil, http_api.Err{Code: 404, Text: "TOPIC_NOT_FOUND"}
+	}
+
+	return nil, nil
+}
+
+func (s *httpServer) doPauseTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, err := http_api.NewReqParams(req)
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failed to parse request params - %s", err)
+		return nil, http_api.Err{Code: 400, Text: "INVALID_REQUEST"}
+	}
+
+	topicName, err := reqParams.Get("topic")
+	if err != nil {
+		return nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+	}
+
+	topic, err := s.ctx.nsqd.GetExistingTopic(topicName)
+	if err != nil {
+		return nil, http_api.Err{Code: 404, Text: "TOPIC_NOT_FOUND"}
+	}
+
+	if strings.Contains(req.URL.Path, "unpause") {
+		err = topic.UnPause()
+	} else {
+		err = topic.Pause()
+	}
+
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failure in %s - %s", req.URL.Path, err)
+		return nil, http_api.Err{Code: 500, Text: "INTERNAL_ERROR"}
+	}
+
+	// pro-actively persist metadata so in case of process failure
+	// nsqd won't suddenly (un)pause a topic
+	s.ctx.nsqd.Lock()
+	s.ctx.nsqd.PersistMetadata()
+	s.ctx.nsqd.Unlock()
+	return nil, nil
+}
+
+func (s *httpServer) getExistingTopicFromQuery(req *http.Request) (*http_api.ReqParams, *Topic, string, error) {
+	reqParams, err := http_api.NewReqParams(req)
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failed to parse request params - %s", err)
+		return nil, nil, "", http_api.Err{Code: 400, Text: "INVALID_REQUEST"}
+	}
+
+	topicName, channelName, err := http_api.GetTopicChannelArgs(reqParams)
+	if err != nil {
+		return nil, nil, "", http_api.Err{Code: 400, Text: err.Error()}
+	}
+
+	topic, err := s.ctx.nsqd.GetExistingTopic(topicName)
+	if err != nil {
+		return nil, nil, "", http_api.Err{Code: 404, Text: "TOPIC_NOT_FOUND"}
+	}
+	return reqParams, topic, channelName, err
+}
+
+func (s *httpServer) getTopicFromQuery(req *http.Request) (url.Values, *Topic, error) {
+	reqParams, err := url.ParseQuery(req.URL.RawQuery)
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failed to parse request params - %s", err)
+		return nil, nil, http_api.Err{Code: 400, Text: "INVALID_REQUEST"}
+	}
+
+	topicNames, ok := reqParams["topic"]
+	if !ok {
+		return nil, nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
+	}
+
+	topicName := topicNames[0]
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, nil, http_api.Err{Code: 400, Text: "INVALID_TOPIC"}
+	}
+
+	return reqParams, s.ctx.nsqd.GetTopic(topicName), nil
+}
+
+func (s *httpServer) doCreateChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	_, topic, channelName, err := s.getExistingTopicFromQuery(req)
+	if err != nil {
+		return nil, err
+	}
+	topic.GetChannel(channelName)
+	return nil, nil
+}
+
+func (s *httpServer) doEmptyChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	_, topic, channelName, err := s.getExistingTopicFromQuery(req)
+	if err != nil {
+		return nil, err
+	}
+
+	channel, err := topic.GetExistingChannel(channelName)
+	if err != nil {
+		return nil, http_api.Err{Code: 404, Text: "CHANNEL_NOT_FOUND"}
+	}
+
+	err = channel.Empty()
+	if err != nil {
+		return nil, http_api.Err{Code: 500, Text: "INTERNAL_ERROR"}
+	}
+
+	return nil, nil
+}
+
+func (s *httpServer) doDeleteChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	_, topic, channelName, err := s.getExistingTopicFromQuery(req)
+	if err != nil {
+		return nil, err
+	}
+
+	err = topic.DeleteExistingChannel(channelName)
+	if err != nil {
+		return nil, http_api.Err{Code: 404, Text: "CHANNEL_NOT_FOUND"}
+	}
+
+	return nil, nil
+}
+
+func (s *httpServer) doPauseChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	_, topic, channelName, err := s.getExistingTopicFromQuery(req)
+	if err != nil {
+		return nil, err
+	}
+
+	channel, err := topic.GetExistingChannel(channelName)
+	if err != nil {
+		return nil, http_api.Err{Code: 404, Text: "CHANNEL_NOT_FOUND"}
+	}
+
+	if strings.Contains(req.URL.Path, "unpause") {
+		err = channel.UnPause()
+	} else {
+		err = channel.Pause()
+	}
+
+	if err != nil {
+		s.ctx.nsqd.logf(lg.ERROR, "failure in %s - %s", req.URL.Path, err)
+		return nil, http_api.Err{Code: 500, Text: "INTERNAL_ERROR"}
+	}
+
+	// pro-actively persist metadata so incase of process failure
+	// nsqd won't suddenly (un)pause a channel
+	s.ctx.nsqd.Lock()
+	s.ctx.nsqd.PersistMetadata()
+	s.ctx.nsqd.Unlock()
+	return nil, nil
 }
 
 func (s *httpServer) pingHandler(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
@@ -93,27 +332,6 @@ func (s *httpServer) doInfo(w http.ResponseWriter, req *http.Request, ps httprou
 		HTTPPort:         s.ctx.nsqd.RealHTTPAddr().Port,
 		StartTime:        s.ctx.nsqd.GetStartTime().Unix(),
 	}, nil
-}
-
-func (s *httpServer) getTopicFromQuery(req *http.Request) (url.Values, *Topic, error) {
-	reqParams, err := url.ParseQuery(req.URL.RawQuery)
-	if err != nil {
-		s.ctx.nsqd.logf(lg.ERROR, "failed to parse request params - %s", err)
-		return nil, nil, http_api.Err{Code: 400, Text: "INVALID_REQUEST"}
-	}
-
-	topicNames, ok := reqParams["topic"]
-	if !ok {
-		return nil, nil, http_api.Err{Code: 400, Text: "MISSING_ARG_TOPIC"}
-	}
-
-	topicName := topicNames[0]
-
-	if !protocol.IsValidTopicName(topicName) {
-		return nil, nil, http_api.Err{Code: 400, Text: "INVALID_TOPIC"}
-	}
-
-	return reqParams, s.ctx.nsqd.GetTopic(topicName), nil
 }
 
 func (s *httpServer) doPub(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
@@ -438,4 +656,69 @@ func (s *httpServer) printStats(stats []TopicStats, producerStats []ClientStats,
 	}
 
 	return buf.Bytes()
+}
+
+func (s *httpServer) doConfig(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	opt := ps.ByName("opt")
+
+	if req.Method == "PUT" {
+		// add 1 so that it's greater than our max when we test for it
+		// (LimitReader returns a "fake" EOF)
+		readMax := s.ctx.nsqd.getOpts().MaxMsgSize + 1
+		body, err := ioutil.ReadAll(io.LimitReader(req.Body, readMax))
+		if err != nil {
+			return nil, http_api.Err{Code: 500, Text: "INTERNAL_ERROR"}
+		}
+		if int64(len(body)) == readMax || len(body) == 0 {
+			return nil, http_api.Err{Code: 400, Text: "INVALID_VALUE"}
+		}
+
+		opts := *s.ctx.nsqd.getOpts()
+		switch opt {
+		case "nsqdlookupd_tcp_addres":
+			err := json.Unmarshal(body, &opts.NSQLookupdTCPAddress)
+			if err != nil {
+				return nil, http_api.Err{Code: 400, Text: "INVALID_VALUE"}
+			}
+		case "log_level":
+			logLevelStr := string(body)
+			logLevel, err := lg.ParseLogLevel(logLevelStr, false)
+			if err != nil {
+				return nil, http_api.Err{Code: 400, Text: "INVALID_VALUE"}
+			}
+			opts.LogLevel = logLevelStr
+			opts.logLevel = logLevel
+		default:
+			return nil, http_api.Err{Code: 400, Text: "INVALID_OPTION"}
+		}
+	}
+
+	v, ok := getOptByCfgName(s.ctx.nsqd.getOpts(), opt)
+	if !ok {
+		return nil, http_api.Err{Code: 400, Text: "INVALID_OPTION"}
+	}
+
+	return v, nil
+}
+
+func getOptByCfgName(opts interface{}, name string) (interface{}, bool) {
+	val := reflect.ValueOf(opts).Elem()
+	typ := val.Type()
+
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		flagName := field.Tag.Get("flag")
+		cfgName := field.Tag.Get("cfg")
+		if flagName == "" {
+			continue
+		}
+		if cfgName == "" {
+			cfgName = strings.Replace(flagName, "-", "_", -1)
+		}
+		if name != cfgName {
+			continue
+		}
+		return val.FieldByName(field.Name).Interface(), true
+	}
+	return nil, false
 }
