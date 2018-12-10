@@ -226,3 +226,23 @@ func (n *NSQD) GetExistingTopic(topicName string) (*Topic, error) {
 	}
 	return topic, nil
 }
+
+// AddClient add a client to nsqd instance
+func (n *NSQD) AddClient(clientID int64, client Client) {
+	n.clientLock.Lock()
+	// clientId has been assured unique
+	n.clients[clientID] = client
+	n.clientLock.Unlock()
+}
+
+// RemoveClient remove client
+func (n *NSQD) RemoveClient(clientID int64) {
+	n.clientLock.Lock()
+	_, ok := n.clients[clientID]
+	if !ok {
+		n.clientLock.Unlock()
+		return
+	}
+	delete(n.clients, clientID)
+	n.clientLock.Unlock()
+}

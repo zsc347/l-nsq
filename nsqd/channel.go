@@ -510,6 +510,21 @@ func (c *Channel) RemoveClient(clientID int64) {
 	}
 }
 
+// StartInFlightTimeout start timeout of inflight queue
+func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
+	now := time.Now()
+	msg.clientID = clientID
+	msg.deliveryTS = now
+	msg.pri = now.Add(timeout).UnixNano()
+
+	err := c.pushInFlightMessage(msg)
+	if err != nil {
+		return err
+	}
+	c.addToInFlightPQ(msg)
+	return nil
+}
+
 func (c *Channel) processDeferredQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()

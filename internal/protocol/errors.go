@@ -1,5 +1,28 @@
 package protocol
 
+// ChildErr define interface for error which has a parent
+type ChildErr interface {
+	Parent() error
+}
+
+// ClientErr define client error
+type ClientErr struct {
+	ParentErr error
+	Code      string
+	Desc      string
+}
+
+// Error returns string from mathine
+func (e *ClientErr) Error() string {
+	return e.Code + " " + e.Desc
+}
+
+// Parent returns parent error of client error
+func (e *ClientErr) Parent() error {
+	return e.ParentErr
+}
+
+// FatalClientErr define fatal error
 type FatalClientErr struct {
 	ParentErr error
 	Code      string
@@ -16,7 +39,7 @@ func (e *FatalClientErr) Parent() error {
 	return e.ParentErr
 }
 
-// NewClientErr creates a ClientErr with the supplied human and machine readable strings
+// NewFatalClientErr creates a ClientErr with the supplied human and machine readable strings
 func NewFatalClientErr(parent error, code string, description string) *FatalClientErr {
 	return &FatalClientErr{parent, code, description}
 }
