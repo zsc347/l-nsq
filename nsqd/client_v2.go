@@ -34,6 +34,7 @@ type identifyDataV2 struct {
 	OutputBufferSize    int    `json:"output_buffer_size"`
 	OutputBufferTimeout int    `json:"output_buffer_timeout"`
 	FeatureNegotiation  bool   `json:"feature_negotiation"`
+	TLSv1               bool   `json:"tls_v1"`
 	Deflate             bool   `json:"deflate"`
 	DeflateLevel        int    `json:"deflate_level"`
 	Snappy              bool   `json:"snappy"`
@@ -518,6 +519,8 @@ func (c *clientV2) UpgradeTLS() error {
 	defer c.writeLock.Unlock()
 
 	// why client use tls.Server ?
+	// because this is server side conn record for client
+	// handshake start by server
 	tlsConn := tls.Server(c.Conn, c.ctx.nsqd.tlsConfig)
 	tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
 
@@ -534,6 +537,7 @@ func (c *clientV2) UpgradeTLS() error {
 	return nil
 }
 
+// UpdateDeflate use deflate to read and write after called
 func (c *clientV2) UpgradeDeflate(level int) error {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
@@ -554,7 +558,8 @@ func (c *clientV2) UpgradeDeflate(level int) error {
 	return nil
 }
 
-func (c *clientV2) UpgradeSnappy(level int) error {
+// UpgradeSnappy use snappy compressor to read and write after called
+func (c *clientV2) UpgradeSnappy() error {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
 

@@ -22,6 +22,11 @@ func (e *ClientErr) Parent() error {
 	return e.ParentErr
 }
 
+// NewClientErr creates a ClientErr with the supplied human and machine readable strings
+func NewClientErr(parent error, code string, description string) *ClientErr {
+	return &ClientErr{parent, code, description}
+}
+
 // FatalClientErr define fatal error
 type FatalClientErr struct {
 	ParentErr error

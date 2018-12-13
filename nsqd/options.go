@@ -40,9 +40,18 @@ type Options struct {
 
 	// client overridable configuration options
 	MaxHeartbeatInterval   time.Duration `flag:"max-heartbeat-interval"`
+	MaxRdyCount            int64         `flag:"max-rdy-count"`
 	MaxOutputBufferSize    int64         `flag:"max-output-buffer-size"`
 	MaxOutputBufferTimeout time.Duration `flag:"max-output-buffer-timeout"`
 
 	// msg and command options
 	MaxMsgTimeout time.Duration `flag:"max-msg-timeout"`
+
+	// compression
+	DeflateEnabled  bool `flag:"deflate"`
+	MaxDeflateLevel int  `flag:"max-deflate-level"`
+	SnappyEnabled   bool `flag:"snappy"`
+
+	// TLS config
+	TLSRequired int `flag:"tls-required"`
 }

@@ -15,6 +15,13 @@ import (
 	"github.com/l-nsq/internal/util"
 )
 
+// tls requried level
+const (
+	TLSNotRequired = iota
+	TLSRequiredExceptHTTP
+	TLSRequired
+)
+
 type errStore struct {
 	err error
 }
@@ -245,4 +252,8 @@ func (n *NSQD) RemoveClient(clientID int64) {
 	}
 	delete(n.clients, clientID)
 	n.clientLock.Unlock()
+}
+
+func (n *NSQD) IsAuthEnabled() bool {
+	return len(n.getOpts().AuthHTTPAddresses) != 0
 }
