@@ -301,14 +301,55 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	switch {
 	case bytes.Equal(params[0], []byte("FIN")):
 		return p.FIN(client, params)
+	case bytes.Equal(params[0], []byte("RDY")):
+		return p.RDY(client, params)
 	}
 
 	panic("NOT IMPLEMENT YET")
 }
 
+// RDY set client ready count and then try notify client ready chan to trigger message pump
+func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
+	state := atomic.LoadInt32(&client.State)
+
+	if state == stateClosing {
+		// just ignore ready changed on a closing channel
+		p.ctx.nsqd.logf(lg.INFO,
+			"PROTOCOL(V2): [%s] ignoring RDY after CLS in state ClientStateV2Closing",
+			client)
+		return nil, nil
+	}
+
+	if state != stateSubscribed {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot RDY in current state")
+	}
+
+	// handle RDY after assert state is stateSubscribed
+	count := int64(1)
+	if len(params) > 1 {
+		b10, err := protocol.ByteToBase10(params[1])
+		if err != nil {
+			return nil, protocol.NewFatalClientErr(err, "E_INVALID",
+				fmt.Sprintf("RDY could not parse count %s", params[1]))
+		}
+		count = int64(b10)
+	}
+
+	if count < 0 || count > p.ctx.nsqd.getOpts().MaxRdyCount {
+		// this needs to be a fatal error otherwise clients would have
+		// inconsistent state
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			fmt.Sprintf("RDY count %d out of range 0-%d", count, p.ctx.nsqd.getOpts().MaxRdyCount))
+	}
+
+	client.SetReadyCount(count)
+	return nil, nil
+}
+
 func (p *protocolV2) IDENTIFY(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
+	// INDENTIFY must in stateInit
 	if atomic.LoadInt32(&client.State) != stateInit {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot IDENTIFY in current state")
 	}
