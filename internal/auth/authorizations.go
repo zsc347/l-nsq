@@ -40,6 +40,8 @@ func (a *Authorization) HasPermission(permission string) bool {
 }
 
 // IsAllowed checks whether allow to access a channel of a topic
+// channel name empty string used for check for publish
+// otherwise means check for subscribe
 func (a *Authorization) IsAllowed(topic, channel string) bool {
 	if channel != "" {
 		if !a.HasPermission("subscribe") {

@@ -36,7 +36,49 @@ type protocolV2 struct {
 
 func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBodySize int64) ([]*Message, error) {
 	// TODO
-	panic("NOT IMPLEMENT YET")
+	numMessages, err := readLen(r, tmp)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			"MPUB failed to read message count")
+	}
+
+	// total message size / min message size(4 byte length each + at least 1 byte body)
+	maxMessages := (maxBodySize - 4) / 5
+
+	if numMessages <= 0 || int64(numMessages) > maxMessages {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			fmt.Sprintf("MPUB invalid message count %d", numMessages))
+	}
+
+	messages := make([]*Message, 0, numMessages)
+	for i := int32(0); i < numMessages; i++ {
+		messageSize, err := readLen(r, tmp)
+		if err != nil {
+			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+				fmt.Sprintf("MPUB failed to read message(%d) body size", i))
+		}
+
+		if messageSize <= 0 {
+			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+				fmt.Sprintf("MPUB invalid message(%d) body size %d", i, messageSize))
+		}
+
+		if int64(messageSize) > maxMessageSize {
+			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+				fmt.Sprintf("MPUB message too big %d > %d", messageSize, maxMessageSize))
+		}
+
+		msgBody := make([]byte, messageSize)
+		_, err = io.ReadFull(r, msgBody)
+		if err != nil {
+			return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
+				"MPUB failed to read message body")
+		}
+
+		messages = append(messages, NewMessage(topic.GenerateID(), msgBody))
+	}
+
+	return messages, nil
 }
 
 func (p *protocolV2) IOLoop(conn net.Conn) error {
@@ -303,9 +345,170 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 		return p.FIN(client, params)
 	case bytes.Equal(params[0], []byte("RDY")):
 		return p.RDY(client, params)
+	case bytes.Equal(params[0], []byte("REQ")):
+		return p.REQ(client, params)
+	case bytes.Equal(params[0], []byte("PUB")):
+		return p.PUB(client, params)
+	case bytes.Equal(params[0], []byte("MPUB")):
+		return p.MPUB(client, params)
+
 	}
 
 	panic("NOT IMPLEMENT YET")
+}
+
+// MPUB publish multiple messages, params ["MPUB", ]
+func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
+	var err error
+
+	if len(params) < 2 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"MPUB insufficient number of parameters")
+	}
+
+	topicName := string(params[1])
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
+			fmt.Sprintf("E_BAD_TOPIC MPUB topic name %q is not valid", topicName))
+	}
+
+	if err := p.CheckAuth(client, "MPUB", topicName, ""); err != nil {
+		return nil, err
+	}
+
+	topic := p.ctx.nsqd.GetTopic(topicName)
+
+	bodyLen, err := readLen(client.Reader, client.lenSlice)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			"MPUB failed to read body size")
+	}
+
+	if bodyLen <= 0 {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+			fmt.Sprintf("MPUB invalid body size %d", bodyLen))
+	}
+
+	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxBodySize {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+			fmt.Sprintf("MPUB body too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxBodySize))
+	}
+
+	messages, err := readMPUB(client.Reader, client.lenSlice, topic,
+		p.ctx.nsqd.getOpts().MaxMsgSize, p.ctx.nsqd.getOpts().MaxBodySize)
+
+	if err != nil {
+		return nil, err
+	}
+
+	err = topic.PutMessages(messages)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_MPUB_FAILED",
+			"MPUB failed "+err.Error())
+	}
+
+	client.PublishedMessage(topicName, uint64(len(messages)))
+
+	return okBytes, nil
+}
+
+// PUB publish message to correspond topic, params ["PUB", topicName]
+func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
+	var err error
+
+	if len(params) < 2 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"PUB insufficient number of parameters")
+	}
+
+	topicName := string(params[1])
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
+			fmt.Sprintf("PUB topic name %q is not valid", topicName))
+	}
+
+	bodyLen, err := readLen(client.Reader, client.lenSlice)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
+			"PUB failed to read message body size")
+	}
+
+	if bodyLen <= 0 {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+			fmt.Sprintf("PUB invalid message body size %d", bodyLen))
+	}
+
+	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxMsgSize {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+			fmt.Sprintf("PUB message too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxMsgSize))
+	}
+
+	messageBody := make([]byte, bodyLen)
+	_, err = io.ReadFull(client.Reader, messageBody)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
+			"PUB failed to read message body")
+	}
+
+	if err := p.CheckAuth(client, "PUB", topicName, ""); err != nil {
+		return nil, err
+	}
+
+	topic := p.ctx.nsqd.GetTopic(topicName)
+	msg := NewMessage(topic.GenerateID(), messageBody)
+	err = topic.PutMessage(msg)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_PUB_FAILED",
+			"PUB failed "+err.Error())
+	}
+	client.PublishedMessage(topicName, 1)
+	return okBytes, nil
+}
+
+// REQ re put a message in queue, params ["REQ", msgID, timeout]
+func (p *protocolV2) REQ(client *clientV2, params [][]byte) ([]byte, error) {
+	state := atomic.LoadInt32(&client.State)
+	if state != stateSubscribed && state != stateClosing {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot REQ in current state")
+	}
+
+	if len(params) < 3 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "REQ insufficient numver of params")
+	}
+
+	id, err := getMessageID(params[1])
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", err.Error())
+	}
+
+	timeoutMs, err := protocol.ByteToBase10(params[2])
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_INVALID",
+			fmt.Sprintf("REQ could not parse timeout %s", params[2]))
+	}
+	timeoutDuration := time.Duration(timeoutMs) * time.Millisecond
+
+	maxReqTimeout := p.ctx.nsqd.getOpts().MaxReqTimeout
+	clampedTimeout := timeoutDuration
+	if timeoutDuration < 0 {
+		clampedTimeout = 0
+	} else if timeoutDuration > maxReqTimeout {
+		clampedTimeout = maxReqTimeout
+	}
+	if clampedTimeout != timeoutDuration {
+		p.ctx.nsqd.logf(lg.INFO, "PROTOCOL(V2): [%s] REQ timeout %d out of range 0-%d. Setting to %d",
+			client, timeoutDuration, maxReqTimeout, clampedTimeout)
+		timeoutDuration = clampedTimeout
+	}
+
+	err = client.Channel.RequeueMessage(client.ID, *id, timeoutDuration)
+	if err != nil {
+		return nil, protocol.NewClientErr(err, "E_REQ_FAILED",
+			fmt.Sprintf("REQ %s failed %s", *id, err.Error()))
+	}
+
+	client.RequeuedMessage()
+	return nil, nil
 }
 
 // RDY set client ready count and then try notify client ready chan to trigger message pump
@@ -570,6 +773,29 @@ func readLen(r io.Reader, tmp []byte) (int32, error) {
 		return 0, err
 	}
 	return int32(binary.BigEndian.Uint32(tmp)), nil
+}
+
+func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName string) error {
+	// if auth enabled, the client must have authorized already
+	// compare topic/channel against cached authorization data (refetching if expired)
+	if client.ctx.nsqd.IsAuthEnabled() {
+		if !client.HasAuthorizations() {
+			return protocol.NewFatalClientErr(nil, "E_AUTH_FIRST",
+				fmt.Sprintf("AUTH required before %s", cmd))
+		}
+
+		ok, err := client.IsAuthorized(topicName, channelName)
+		if err != nil {
+			// we don't want to leak errors contacting the auth server to untrusted client
+			p.ctx.nsqd.logf(lg.WARN, "PROTOCOL(V2): [%s] Auth Failed %s", client, err)
+			return protocol.NewFatalClientErr(nil, "E_AUTH_FAILED", "AUTH failed")
+		}
+		if !ok {
+			return protocol.NewFatalClientErr(nil, "E_UNAUTHORIZED",
+				fmt.Sprintf("AUTH failed for %s on %q %q", cmd, topicName, channelName))
+		}
+	}
+	return nil
 }
 
 func enforceTLSPolicy(client *clientV2, p *protocolV2, command []byte) error {
