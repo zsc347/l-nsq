@@ -351,10 +351,118 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 		return p.PUB(client, params)
 	case bytes.Equal(params[0], []byte("MPUB")):
 		return p.MPUB(client, params)
-
+	case bytes.Equal(params[0], []byte("DPUB")):
+		return p.DPUB(client, params)
+	case bytes.Equal(params[0], []byte("NOP")):
+		return p.NOP(client, params)
+	case bytes.Equal(params[0], []byte("TOUCH")):
+		return p.TOUCH(client, params)
 	}
 
 	panic("NOT IMPLEMENT YET")
+}
+
+// TOUCH touch a message for reset timeout, params ["TOUCH", messageID]
+func (p *protocolV2) TOUCH(client *clientV2, params [][]byte) ([]byte, error) {
+	state := atomic.LoadInt32(&client.State)
+	if state != stateSubscribed && state != stateClosing {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"cannot TOUCH in current state")
+	}
+
+	if len(params) < 2 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"TOUCH insufficient number of params")
+	}
+
+	id, err := getMessageID(params[1])
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", err.Error())
+	}
+
+	client.writeLock.RLock()
+	msgTimeout := client.MsgTimeout
+	client.writeLock.RUnlock()
+	err = client.Channel.TouchMessage(client.ID, *id, msgTimeout)
+	if err != nil {
+		return nil, protocol.NewClientErr(err, "E_TOUCH_FAILED",
+			fmt.Sprintf("TOUCH %s failed %s", *id, err.Error()))
+	}
+
+	return nil, nil
+}
+
+// NOP nothing need to do
+func (p *protocolV2) NOP(client *clientV2, params [][]byte) ([]byte, error) {
+	return nil, nil
+}
+
+// DPUB publish a deferred message
+func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
+	var err error
+
+	if len(params) < 3 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"DPUB insufficient number of parameters")
+	}
+
+	topicName := string(params[1])
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
+			fmt.Sprintf("DPUB topic name %q is not valid", topicName))
+	}
+
+	timeoutMs, err := protocol.ByteToBase10(params[2])
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_INVALID",
+			fmt.Sprintf("DPUB could not parse timeout %s", params[2]))
+	}
+	timeoutDuration := time.Duration(timeoutMs) * time.Millisecond
+
+	if timeoutDuration < 0 || timeoutDuration > p.ctx.nsqd.getOpts().MaxReqTimeout {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			fmt.Sprintf("DPUB timeout %d out of range 0-%d",
+				timeoutMs, p.ctx.nsqd.getOpts().MaxReqTimeout/time.Millisecond))
+	}
+
+	bodyLen, err := readLen(client.Reader, client.lenSlice)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
+			"DPUB failed to read message body size")
+	}
+
+	if bodyLen <= 0 {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+			fmt.Sprintf("DPUB invalid message body size %d", bodyLen))
+	}
+
+	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxMsgSize {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+			fmt.Sprintf("DPUB message too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxMsgSize))
+	}
+
+	messageBody := make([]byte, bodyLen)
+	_, err = io.ReadFull(client.Reader, messageBody)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
+			"DPUB failed to read message body")
+	}
+
+	if err := p.CheckAuth(client, "DPUB", topicName, ""); err != nil {
+		return nil, err
+	}
+
+	topic := p.ctx.nsqd.GetTopic(topicName)
+	msg := NewMessage(topic.GenerateID(), messageBody)
+	msg.deferred = timeoutDuration
+	err = topic.PutMessage(msg)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_DPUB_FAILED",
+			"DPUB failed "+err.Error())
+	}
+
+	client.PublishedMessage(topicName, 1)
+	return okBytes, nil
 }
 
 // MPUB publish multiple messages, params ["MPUB", ]
@@ -369,7 +477,7 @@ func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	topicName := string(params[1])
 	if !protocol.IsValidTopicName(topicName) {
 		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
-			fmt.Sprintf("E_BAD_TOPIC MPUB topic name %q is not valid", topicName))
+			fmt.Sprintf("MPUB topic name %q is not valid", topicName))
 	}
 
 	if err := p.CheckAuth(client, "MPUB", topicName, ""); err != nil {
