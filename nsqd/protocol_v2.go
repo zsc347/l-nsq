@@ -34,53 +34,6 @@ type protocolV2 struct {
 	ctx *context
 }
 
-func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBodySize int64) ([]*Message, error) {
-	// TODO
-	numMessages, err := readLen(r, tmp)
-	if err != nil {
-		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
-			"MPUB failed to read message count")
-	}
-
-	// total message size / min message size(4 byte length each + at least 1 byte body)
-	maxMessages := (maxBodySize - 4) / 5
-
-	if numMessages <= 0 || int64(numMessages) > maxMessages {
-		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
-			fmt.Sprintf("MPUB invalid message count %d", numMessages))
-	}
-
-	messages := make([]*Message, 0, numMessages)
-	for i := int32(0); i < numMessages; i++ {
-		messageSize, err := readLen(r, tmp)
-		if err != nil {
-			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
-				fmt.Sprintf("MPUB failed to read message(%d) body size", i))
-		}
-
-		if messageSize <= 0 {
-			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
-				fmt.Sprintf("MPUB invalid message(%d) body size %d", i, messageSize))
-		}
-
-		if int64(messageSize) > maxMessageSize {
-			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
-				fmt.Sprintf("MPUB message too big %d > %d", messageSize, maxMessageSize))
-		}
-
-		msgBody := make([]byte, messageSize)
-		_, err = io.ReadFull(r, msgBody)
-		if err != nil {
-			return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
-				"MPUB failed to read message body")
-		}
-
-		messages = append(messages, NewMessage(topic.GenerateID(), msgBody))
-	}
-
-	return messages, nil
-}
-
 func (p *protocolV2) IOLoop(conn net.Conn) error {
 	var err error
 	var line []byte
@@ -188,8 +141,9 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var flusherChan <-chan time.Time
 	var sampleRate int32
 
-	subEventChan := client.SubEventChan
+	subEventChan := client.SubEventChan // subscribe event chan
 	identifyEventChan := client.IdentityEventChan
+
 	outputBufferTicker := time.NewTicker(client.OutputBufferTimeout)
 	heartbeatTicker := time.NewTicker(client.HeartbeatInterval)
 	heartbeatChan := heartbeatTicker.C
@@ -210,6 +164,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	for {
 		if subChannel == nil || !client.IsReadyForMessages() {
 			// the client is not ready to receive messages...
+			// if subscribe channel is not build, then flush client every time
 			memoryMsgChan = nil
 			backendMsgChan = nil
 			flusherChan = nil
@@ -252,7 +207,8 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 			flushed = true
 		case <-client.ReadyStateChan:
 		case subChannel = <-subEventChan:
-			// what's the useage of sub channel
+			// only allow to subscribe one channel
+			// after this message subscribe channel has been build
 			// only one sub channel
 			// you can't SUB anymore
 			subEventChan = nil
@@ -1061,4 +1017,51 @@ func enforceTLSPolicy(client *clientV2, p *protocolV2, command []byte) error {
 			fmt.Sprintf("cannot %s in current state (TLS required)", command))
 	}
 	return nil
+}
+
+func readMPUB(r io.Reader, tmp []byte, topic *Topic, maxMessageSize int64, maxBodySize int64) ([]*Message, error) {
+	// TODO
+	numMessages, err := readLen(r, tmp)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			"MPUB failed to read message count")
+	}
+
+	// total message size / min message size(4 byte length each + at least 1 byte body)
+	maxMessages := (maxBodySize - 4) / 5
+
+	if numMessages <= 0 || int64(numMessages) > maxMessages {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			fmt.Sprintf("MPUB invalid message count %d", numMessages))
+	}
+
+	messages := make([]*Message, 0, numMessages)
+	for i := int32(0); i < numMessages; i++ {
+		messageSize, err := readLen(r, tmp)
+		if err != nil {
+			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+				fmt.Sprintf("MPUB failed to read message(%d) body size", i))
+		}
+
+		if messageSize <= 0 {
+			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+				fmt.Sprintf("MPUB invalid message(%d) body size %d", i, messageSize))
+		}
+
+		if int64(messageSize) > maxMessageSize {
+			return nil, protocol.NewFatalClientErr(nil, "E_BAD_MESSAGE",
+				fmt.Sprintf("MPUB message too big %d > %d", messageSize, maxMessageSize))
+		}
+
+		msgBody := make([]byte, messageSize)
+		_, err = io.ReadFull(r, msgBody)
+		if err != nil {
+			return nil, protocol.NewFatalClientErr(err, "E_BAD_MESSAGE",
+				"MPUB failed to read message body")
+		}
+
+		messages = append(messages, NewMessage(topic.GenerateID(), msgBody))
+	}
+
+	return messages, nil
 }
