@@ -357,12 +357,161 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 		return p.NOP(client, params)
 	case bytes.Equal(params[0], []byte("TOUCH")):
 		return p.TOUCH(client, params)
+	case bytes.Equal(params[0], []byte("SUB")):
+		return p.SUB(client, params)
+	case bytes.Equal(params[0], []byte("CLS")):
+		return p.CLS(client, params)
+	case bytes.Equal(params[0], []byte("AUTH")):
+		return p.AUTH(client, params)
 	}
 
 	panic("NOT IMPLEMENT YET")
 }
 
-// TOUCH touch a message for reset timeout, params ["TOUCH", messageID]
+func (p *protocolV2) AUTH(client *clientV2, params [][]byte) ([]byte, error) {
+	if atomic.LoadInt32(&client.State) != stateInit {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"can not AUTH in current state")
+	}
+
+	if len(params) != 1 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"AUTH invalid number of parameters")
+	}
+
+	bodyLen, err := readLen(client.Reader, client.lenSlice)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			"AUTH failed to read body size")
+	}
+
+	if int64(bodyLen) > p.ctx.nsqd.getOpts().MaxBodySize {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+			fmt.Sprintf("AUTH body  too big %d > %d", bodyLen, p.ctx.nsqd.getOpts().MaxBodySize))
+	}
+
+	if bodyLen <= 0 {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_BODY",
+			fmt.Sprintf("AUTH invalid body size %d", bodyLen))
+	}
+
+	body := make([]byte, bodyLen)
+	_, err = io.ReadFull(client.Reader, body)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_BAD_BODY",
+			"AUTH failed to read body")
+	}
+
+	if client.HasAuthorizations() {
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_DISABLED", "AUTH already set")
+	}
+
+	if err := client.Auth(string(body)); err != nil {
+		// we don't want to leak errors contacting the auth server to untrusted clients
+		p.ctx.nsqd.logf(lg.WARN, "PROTOCOL(V2): [%s] Auth Failed %s", client, err)
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_FAILED", "AUTH failed")
+	}
+
+	if !client.HasAuthorizations() {
+		return nil, protocol.NewFatalClientErr(nil, "E_UNAUTHORIZED",
+			"AUTH No authorizations found")
+	}
+
+	resp, err := json.Marshal(struct {
+		Identity        string `json:"identity"`
+		IdentityURL     string `json:"identity_url"`
+		PermissionCount int    `json:"permission_couent"`
+	}{
+		Identity:        client.AuthState.Identity,
+		IdentityURL:     client.AuthState.IdentityURL,
+		PermissionCount: len(client.AuthState.Authorizations),
+	})
+
+	err = p.Send(client, frameTypeResponse, resp)
+	if err != nil {
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_ERROR",
+			"AUTH error "+err.Error())
+	}
+	return nil, nil
+}
+
+// CLS start to close client, params ["CLS"]
+// it force ready count to 0 for flow control
+// and set client state to stateClosing
+func (p *protocolV2) CLS(client *clientV2, params [][]byte) ([]byte, error) {
+	if atomic.LoadInt32(&client.State) != stateSubscribed {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"cannot CLS in current state")
+	}
+	client.StartClose()
+	return []byte("CLOSE_WAIT"), nil
+}
+
+// SUB subscries a topic, params ["SUB", topicName, channelName]
+func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
+	if atomic.LoadInt32(&client.State) != stateInit {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"can not SUB in current state")
+	}
+
+	if client.HeartbeatInterval <= 0 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"cannot SUB with heartbeat disabled")
+	}
+
+	if len(params) < 3 {
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID",
+			"SUB insufficient number of parameters")
+	}
+
+	topicName := string(params[1])
+	if !protocol.IsValidTopicName(topicName) {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_TOPIC",
+			fmt.Sprintf("SUB topic name %q is not valid", topicName))
+	}
+
+	channelName := string(params[2])
+	if !protocol.IsValidChannelName(channelName) {
+		return nil, protocol.NewFatalClientErr(nil, "E_BAD_CHANNEL",
+			fmt.Sprintf("SUB channel name %q is not valid", channelName))
+	}
+
+	if err := p.CheckAuth(client, "SUB", topicName, channelName); err != nil {
+		return nil, err
+	}
+
+	// This retry-loop is a work-around for a race condition, where the
+	// last client can leave the channel between GetChannel() and AddClient().
+	// Avoid adding a client to an ephemeral channel / topic which has started exiting.
+	var channel *Channel
+	for {
+		topic := p.ctx.nsqd.GetTopic(topicName)
+		channel = topic.GetChannel(channelName)
+		// GetChannel will create a channel if channel not exist
+		// but is channel exit and start exit caused by client leave
+		// then add client won't stop this progress
+		// why not just provide a method in channel which hold a lock for
+		// get channel and add client, such as GetChannelThenAddClient ?
+		// then topic also need the lock, need a lock in topic and channel
+		// which breaks fucked up current decoupling
+		channel.AddClient(client.ID, client)
+
+		if (channel.ephemeral && channel.Exiting()) || (topic.ephemeral && topic.Exiting()) {
+			channel.RemoveClient(client.ID)
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		break
+	}
+
+	atomic.StoreInt32(&client.State, stateSubscribed)
+	client.Channel = channel
+	client.SubEventChan <- channel
+
+	return okBytes, nil
+}
+
+// TOUCH reset timeout of a message, params ["TOUCH", messageID]
 func (p *protocolV2) TOUCH(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {
