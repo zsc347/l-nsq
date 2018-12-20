@@ -68,6 +68,8 @@ type NSQD struct {
 
 	waitGroup util.WaitGroupWrapper
 
+	poolSize int
+
 	notifyChan           chan interface{}
 	optsNotificationChan chan struct{}
 	exitChan             chan int
@@ -291,8 +293,71 @@ func (n *NSQD) Notify(v interface{}) {
 	})
 }
 
+// queueScanLoop runs in a single goroutine to process in-flight and deferred
+// priority queues. It manages a pool of queuScanWorker (configurable max of)
+// QueueScanWorkerPoolMax (default: 4) that process channels cocurrently.
+//
+// It copies Redis's probabilistic expiration algorithm: it wakes up every
+// QueueScanInterval (default: 100ms) to select a random QueueScanSelectionCount
+// (default: 20) channels from a locally cached list (refreshed every
+// QueueScanRefreshInterval (default: 5s))
+//
+// If either of the queues had work to do the channel is considered "dirty".
+//
+// If QueueScanDirtyPercent (default : 25%) of the selected chanels were dirty,
+// the loop continues without sleep
 func (n *NSQD) queueScanLoop() {
-	// TODO
+	workCh := make(chan *Channel, n.getOpts().QueueScanSelectionCount)
+	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount)
+	closeCh := make(chan int)
+
+	workTicker := time.NewTicker(n.getOpts().QueueScanInterval)
+	refreshTicker := time.NewTicker(n.getOpts().QueueScanRefreshInterval)
+
+	channels := n.channels()
+	n.resizePool(len(channels), workCh, responseCh, closeCh)
+
+	for {
+		select {
+		case <-workTicker.C:
+			if len(channels) == 0 {
+				continue
+			}
+		case <-refreshTicker.C:
+			channels = n.channels()
+			n.resizePool(len(channels), workCh, responseCh, closeCh)
+			continue
+		case <-n.exitChan:
+			goto exit
+		}
+
+	loop:
+		num := n.getOpts().QueueScanSelectionCount
+		if num > len(channels) {
+			num = len(channels)
+		}
+
+		for _, i := range util.UniqRands(num, len(channels)) {
+			workCh <- channels[i]
+		}
+
+		numDirty := 0
+		for i := 0; i < num; i++ {
+			if <-responseCh {
+				numDirty++
+			}
+		}
+
+		if float64(numDirty)/float64(num) > n.getOpts().QueueScanDirtyPercent {
+			goto loop
+		}
+	}
+
+exit:
+	n.logf(lg.INFO, "QUEUESCAN: closing")
+	close(closeCh)
+	workTicker.Stop()
+	refreshTicker.Stop()
 }
 
 func (n *NSQD) lookupLoop() {
@@ -478,4 +543,68 @@ func (n *NSQD) IsAuthEnabled() bool {
 // RealHTTPSAddr return real port binded for https server
 func (n *NSQD) RealHTTPSAddr() *net.TCPAddr {
 	return n.httpsListener.Addr().(*net.TCPAddr)
+}
+
+// channels returns a flat slice of all channels in all topics
+func (n *NSQD) channels() []*Channel {
+	var channels []*Channel
+	n.RLock()
+	for _, t := range n.topicMap {
+		t.RLock()
+		for _, c := range t.channelMap {
+			channels = append(channels, c)
+		}
+		t.RUnlock()
+	}
+	n.RUnlock()
+	return channels
+}
+
+// resizePool adjusts the size of the pool of queueScanWorker goroutines
+//
+// 1 <= pool <= min(num*0.25, QueueScanWorkerPoolMax)
+//
+func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, closeCh chan int) {
+	idealPoolSize := int(float64(num) * 0.25)
+	if idealPoolSize < 1 {
+		idealPoolSize = 1
+	} else if idealPoolSize > n.getOpts().QueueScanWorkerPoolMax {
+		idealPoolSize = n.getOpts().QueueScanWorkerPoolMax
+	}
+	for {
+		if idealPoolSize == n.poolSize {
+			break
+		} else if idealPoolSize < n.poolSize {
+			// contract
+			closeCh <- 1
+			n.poolSize--
+		} else {
+			// expand
+			n.waitGroup.Wrap(func() {
+				n.queueScanWorker(workCh, responseCh, closeCh)
+			})
+			n.poolSize++
+		}
+	}
+}
+
+// queueScanWorker receives work (in the form of a channel) from queueScanLoop
+// and process the deferred and in-flight queues
+func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, closeCh chan int) {
+	for {
+		select {
+		case c := <-workCh:
+			now := time.Now().UnixNano()
+			dirty := false
+			if c.processInFlightQueue(now) {
+				dirty = true
+			}
+			if c.processDeferredQueue(now) {
+				dirty = true
+			}
+			responseCh <- dirty
+		case <-closeCh:
+			return
+		}
+	}
 }
