@@ -103,6 +103,19 @@ func setBlockRateHandler(w http.ResponseWriter, req *http.Request, ps httprouter
 	return nil, nil
 }
 
+func (s *httpServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if !s.tlsEnabled && s.tlsRequired {
+		resp := fmt.Sprintf(`{"message": "TLS_REQUIRED", "https_port: %d"}`,
+			s.ctx.nsqd.RealHTTPSAddr().Port)
+		w.Header().Set("X-NSQ-Content-Type", "nsq; version=1.0")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(403)
+		io.WriteString(w, resp)
+		return
+	}
+	s.router.ServeHTTP(w, req)
+}
+
 func (s *httpServer) doCreateTopic(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
 	_, _, err := s.getTopicFromQuery(req)
 	return nil, err

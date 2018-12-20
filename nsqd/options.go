@@ -78,8 +78,12 @@ type Options struct {
 	SnappyEnabled   bool `flag:"snappy"`
 
 	// TLS config
-	TLSRequired   int    `flag:"tls-required"`
-	TLSMinVersion uint64 `flag:"tls-min-version"`
+	TLSCert             string `flag:"tls-cert"`
+	TLSKey              string `flag:"tls-key"`
+	TLSClientAuthPolicy string `flag:"tls-client-auth-policy"`
+	TLSRootCAFile       string `flag:"tls-root-ca-file"`
+	TLSRequired         int    `flag:"tls-required"`
+	TLSMinVersion       uint16 `flag:"tls-min-version"`
 }
 
 // NewOptions return a new option

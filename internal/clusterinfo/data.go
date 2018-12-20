@@ -13,6 +13,7 @@ import (
 	"github.com/l-nsq/internal/lg"
 )
 
+// ErrList define a list of errors
 type ErrList []error
 
 func (l ErrList) Error() string {
@@ -23,13 +24,23 @@ func (l ErrList) Error() string {
 	return strings.Join(es, "\n")
 }
 
+// Errors return all errors in error list
 func (l ErrList) Errors() []error {
 	return l
 }
 
+// ClusterInfo define struct to get cluster information
 type ClusterInfo struct {
 	log    lg.AppLogFunc
 	client *http_api.Client
+}
+
+// New create a new cluster
+func New(log lg.AppLogFunc, client *http_api.Client) *ClusterInfo {
+	return &ClusterInfo{
+		log:    log,
+		client: client,
+	}
 }
 
 // GetLookupdTopicChannels returns a []string containing a union of all the channels

@@ -2,13 +2,26 @@ package nsqd
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/l-nsq/internal/protocol"
+
+	"github.com/l-nsq/internal/version"
+
+	"github.com/l-nsq/internal/statsd"
+
+	"github.com/l-nsq/internal/dirlock"
+	"github.com/l-nsq/internal/http_api"
 
 	"github.com/l-nsq/internal/clusterinfo"
 	"github.com/l-nsq/internal/lg"
@@ -35,6 +48,7 @@ type NSQD struct {
 
 	opts atomic.Value
 
+	dl        *dirlock.DirLock
 	isLoading int32
 	errValue  atomic.Value // set by channel, set each time when put message
 	startTime time.Time
@@ -46,21 +60,211 @@ type NSQD struct {
 
 	lookupPeers atomic.Value
 
-	tcpListener  net.Listener
-	httpListener net.Listener
+	tcpListener   net.Listener
+	httpListener  net.Listener
+	httpsListener net.Listener
 
 	tlsConfig *tls.Config
 
 	waitGroup util.WaitGroupWrapper
 
-	notifyChan chan interface{}
-	exitChan   chan int
+	notifyChan           chan interface{}
+	optsNotificationChan chan struct{}
+	exitChan             chan int
 
 	ci *clusterinfo.ClusterInfo
 }
 
+// New create a new nsqd instance
+func New(opts *Options) *NSQD {
+	dataPath := opts.DataPath
+	if opts.DataPath == "" {
+		cwd, _ := os.Getwd()
+		dataPath = cwd
+	}
+
+	if opts.Logger == nil {
+		opts.Logger = log.New(os.Stderr, opts.LogPrefix, log.Ldate|log.Ltime|log.Lmicroseconds)
+	}
+
+	n := &NSQD{
+		startTime:            time.Now(),
+		topicMap:             make(map[string]*Topic),
+		clients:              make(map[int64]Client),
+		exitChan:             make(chan int),
+		notifyChan:           make(chan interface{}),
+		optsNotificationChan: make(chan struct{}, 1),
+		dl:                   dirlock.New(dataPath),
+	}
+	httpcli := http_api.NewClient(nil, opts.HTTPClientConnectionTimeout,
+		opts.HTTPClientRequestTimeout)
+	n.ci = clusterinfo.New(n.logf, httpcli)
+
+	n.lookupPeers.Store([]*lookupPeer{})
+	n.errValue.Store(errStore{})
+
+	var err error
+	opts.logLevel, err = lg.ParseLogLevel(opts.LogLevel, false)
+	if err != nil {
+		n.logf(lg.FATAL, "%s", err)
+		os.Exit(1)
+	}
+
+	err = n.dl.Lock()
+	if err != nil {
+		n.logf(lg.FATAL, "--data-path=%s in use (possibly by another instance of nsqd)", dataPath)
+		os.Exit(1)
+	}
+
+	if opts.MaxDeflateLevel < 1 || opts.MaxDeflateLevel > 9 {
+		n.logf(lg.FATAL, "--max-deflate-level must be [1,9]")
+		os.Exit(1)
+	}
+
+	if opts.ID < 0 || opts.ID >= 1024 {
+		n.logf(lg.FATAL, "--node-id must be [0.1024]")
+		os.Exit(1)
+	}
+
+	if opts.StatsdPrefix != "" {
+		var port string
+		_, port, err = net.SplitHostPort(opts.HTTPAddress)
+		if err != nil {
+			n.logf(lg.FATAL, "failed to parse HTTP address (%s) -  %s", opts.HTTPAddress, err)
+			os.Exit(1)
+		}
+		// why broadcast port same with http address port
+		statsHostKey := statsd.HostKey(net.JoinHostPort(opts.BroadcastAddress, port))
+		prefixWithHost := strings.Replace(opts.StatsdPrefix, "%s", statsHostKey, -1)
+		if prefixWithHost[len(prefixWithHost)-1] != '.' {
+			prefixWithHost += "."
+		}
+		opts.StatsdPrefix = prefixWithHost
+	}
+
+	if opts.TLSClientAuthPolicy != "" && opts.TLSRequired == TLSNotRequired {
+		opts.TLSRequired = TLSRequired
+	}
+
+	tlsConfig, err := buildTLSConfig(opts)
+	if err != nil {
+		n.logf(lg.FATAL, "failed to build TLS config - %s", err)
+	}
+	if tlsConfig == nil && opts.TLSRequired != TLSNotRequired {
+		n.logf(lg.FATAL, "cannot require TLS client connections without TLS key and cert")
+		os.Exit(1)
+	}
+	n.tlsConfig = tlsConfig
+
+	for _, v := range opts.E2EProcessingLatencyPercentiles {
+		if v <= 0 || v > 1 {
+			n.logf(lg.FATAL, "Invalid percentile: %v", v)
+			os.Exit(1)
+		}
+	}
+
+	n.logf(lg.INFO, version.String("nsqd"))
+	n.logf(lg.INFO, "ID: %d", opts.ID)
+	return n
+}
+
+func buildTLSConfig(opts *Options) (*tls.Config, error) {
+	var tlsConfig *tls.Config
+
+	if opts.TLSCert == "" && opts.TLSKey == "" {
+		return nil, nil
+	}
+
+	tlsClientAuthPolicy := tls.VerifyClientCertIfGiven
+
+	cert, err := tls.LoadX509KeyPair(opts.TLSCert, opts.TLSKey)
+	if err != nil {
+		return nil, err
+	}
+
+	switch opts.TLSClientAuthPolicy {
+	case "require":
+		tlsClientAuthPolicy = tls.RequestClientCert
+	case "require-verify":
+		tlsClientAuthPolicy = tls.RequireAndVerifyClientCert
+	default:
+		tlsClientAuthPolicy = tls.NoClientCert
+	}
+
+	tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tlsClientAuthPolicy,
+		MinVersion:   opts.TLSMinVersion,
+		MaxVersion:   tls.VersionTLS12,
+	}
+
+	if opts.TLSRootCAFile != "" {
+		tlsCertPool := x509.NewCertPool()
+		caCertFile, err := ioutil.ReadFile(opts.TLSRootCAFile)
+		if err != nil {
+			return nil, err
+		}
+		if !tlsCertPool.AppendCertsFromPEM(caCertFile) {
+			return nil, errors.New("failed to append certificate to pool")
+		}
+		tlsConfig.ClientCAs = tlsCertPool
+	}
+	return tlsConfig, nil
+}
+
 func (n *NSQD) getOpts() *Options {
 	return n.opts.Load().(*Options)
+}
+
+func (n *NSQD) Main() {
+	var err error
+	ctx := &context{n}
+
+	n.tcpListener, err = net.Listen("tcp", n.getOpts().TCPAddress)
+	if err != nil {
+		n.logf(lg.FATAL, "listen (%s) failed - %s", n.getOpts(), err)
+		os.Exit(1)
+	}
+
+	n.httpListener, err = net.Listen("tcp", n.getOpts().HTTPAddress)
+	if err != nil {
+		n.logf(lg.FATAL, "listen (%s) failed - %s", n.getOpts().HTTPAddress, err)
+		os.Exit(1)
+	}
+
+	if n.tlsConfig != nil && n.getOpts().HTTPSAddress != "" {
+		n.httpsListener, err = tls.Listen("tcp", n.getOpts().HTTPSAddress, n.tlsConfig)
+		if err != nil {
+			n.logf(lg.FATAL, "listen (%s) failed - %s", n.getOpts().HTTPSAddress, err)
+			os.Exit(1)
+		}
+	}
+
+	tcpServer := &tcpServer{ctx: ctx}
+	n.waitGroup.Wrap(func() {
+		protocol.TCPServer(n.tcpListener, tcpServer, n.logf)
+	})
+
+	httpServer := newHTTPServer(ctx, false, n.getOpts().TLSRequired == TLSRequired)
+	n.waitGroup.Wrap(func() {
+		http_api.Serve(n.httpListener, httpServer, "HTTP", n.logf)
+	})
+	if n.tlsConfig != nil && n.getOpts().HTTPSAddress != "" {
+		httpsServer := newHTTPServer(ctx, true, true)
+		n.waitGroup.Wrap(func() {
+			http_api.Serve(n.httpsListener, httpsServer, "HTTPS", n.logf)
+		})
+	}
+
+	n.waitGroup.Wrap(n.queueScanLoop)
+	n.waitGroup.Wrap(n.lookupLoop)
+	if n.getOpts().StatsdAddress != "" {
+		n.waitGroup.Wrap(n.statsdLoop)
+	}
+}
+
+func (n *NSQD) swapOpts(opts *Options) {
+	n.opts.Store(opts)
 }
 
 // Notify allow chanel or topic to notify nsqd instance
@@ -85,6 +289,18 @@ func (n *NSQD) Notify(v interface{}) {
 			n.Unlock()
 		}
 	})
+}
+
+func (n *NSQD) queueScanLoop() {
+	// TODO
+}
+
+func (n *NSQD) lookupLoop() {
+	// TODO
+}
+
+func (n *NSQD) statsdLoop() {
+	// TODO
 }
 
 // PersistMetadata persist nsqd metadata
@@ -254,6 +470,12 @@ func (n *NSQD) RemoveClient(clientID int64) {
 	n.clientLock.Unlock()
 }
 
+// IsAuthEnabled return whether auth is enabled
 func (n *NSQD) IsAuthEnabled() bool {
 	return len(n.getOpts().AuthHTTPAddresses) != 0
+}
+
+// RealHTTPSAddr return real port binded for https server
+func (n *NSQD) RealHTTPSAddr() *net.TCPAddr {
+	return n.httpsListener.Addr().(*net.TCPAddr)
 }
