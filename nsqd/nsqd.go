@@ -3,18 +3,19 @@ package nsqd
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/l-nsq/internal/writers"
 
 	"github.com/l-nsq/internal/protocol"
 
@@ -362,146 +363,6 @@ exit:
 	refreshTicker.Stop()
 }
 
-func (n *NSQD) statsdLoop() {
-	var lastMemStats memStats
-	var lastStats []TopicStats
-	interval := n.getOpts().StatsdInterval
-	ticker := time.NewTicker(interval)
-
-	for {
-		select {
-		case <-n.exitChan:
-			goto exit
-		case <-ticker.C:
-			addr := n.getOpts().StatsdAddress
-			conn, err := net.DialTimeout("udp", addr, time.Second)
-			if err != nil {
-				n.logf(lg.ERROR, "failed to create UDP socket to statsd(%s)", addr)
-				continue
-			}
-
-			sw := writers.NewSpreadWriter(conn, interval-time.Second, n.exitChan)
-			bw := writers.NewBoundaryBufferedWriter(sw, n.getOpts().StatsdUDPPacketSize)
-
-			prefix := n.getOpts().StatsdPrefix
-			client := statsd.NewClient(bw, prefix)
-			n.logf(lg.INFO, "STATSD: pushing stats to %s", addr)
-
-			stats := n.GetStats("", "")
-			for _, topic := range stats {
-				// try to find the topic in the last collection
-				lastTopic := TopicStats{}
-				for _, checkTopic := range lastStats {
-					if topic.TopicName == checkTopic.TopicName {
-						lastTopic = checkTopic
-						break
-					}
-				}
-				diff := topic.MessageCount - lastTopic.MessageCount
-				stat := fmt.Sprintf("topic.%s.message_count", topic.TopicName)
-				client.Incr(stat, int64(diff))
-
-				stat = fmt.Sprintf("topic.%s.depth", topic.TopicName)
-				client.Guage(stat, topic.Depth)
-
-				stat = fmt.Sprintf("topic.%s.backend_depth", topic.TopicName)
-				client.Guage(stat, topic.BackendDepth)
-
-				for _, item := range topic.E2eProcessingLatency.Percentiles {
-					stat = fmt.Sprintf("topic.%s.e2e_processing_latency_%.0f",
-						topic.TopicName, item["quantile"]*100.0)
-					// We can cast the value to int64 since a value of 1 is the
-					// minimum resolution we will have, so there is no loss of
-					// accuracy
-					client.Guage(stat, int64(item["value"]))
-				}
-
-				for _, channel := range topic.Channels {
-					// try to find the channel in the last collection
-					lastChannel := ChannelStats{}
-					for _, checkChannel := range lastTopic.Channels {
-						if channel.ChannelName == checkChannel.ChannelName {
-							lastChannel = checkChannel
-							break
-						}
-					}
-					diff := channel.MessageCount - lastChannel.MessageCount
-					stat := fmt.Sprintf("topic.%s.channel.%s.message_count",
-						topic.TopicName, channel.ChannelName)
-					client.Incr(stat, int64(diff))
-
-					stat = fmt.Sprintf("topic.%s.channel.%s.depth",
-						topic.TopicName, channel.ChannelName)
-					client.Guage(stat, channel.Depth)
-
-					stat = fmt.Sprintf("topic.%s.channel.%s.backend_depth",
-						topic.TopicName, channel.ChannelName)
-					client.Guage(stat, channel.BackendDepth)
-
-					stat = fmt.Sprintf("topic.%s.channe.%s.in_flight_count",
-						topic.TopicName, channel.ChannelName)
-					client.Guage(stat, int64(channel.InFlightCount))
-
-					stat = fmt.Sprintf("topic.%s.channe.%s.deferred_count",
-						topic.TopicName, channel.ChannelName)
-					client.Guage(stat, int64(channel.DeferredCount))
-
-					diff = channel.RequeueCount - lastChannel.RequeueCount
-					stat = fmt.Sprintf("topic.%s.channe.%s.requeque_count",
-						topic.TopicName, channel.ChannelName)
-					client.Incr(stat, int64(channel.RequeueCount))
-
-					diff = channel.TimeoutCount - lastChannel.TimeoutCount
-					stat = fmt.Sprintf("topic.%s.channe.%s.timeout_count",
-						topic.TopicName, channel.ChannelName)
-					client.Incr(stat, int64(channel.TimeoutCount))
-
-					stat = fmt.Sprintf("topic.%s.channel.%s.clients",
-						topic.TopicName, channel.ChannelName)
-					client.Guage(stat, int64(len(channel.Clients)))
-
-					for _, item := range channel.E2eProcessingLatency.Percentiles {
-						stat = fmt.Sprintf("topic.%s.channel.%s.e2e_processing_latency_%.0f",
-							topic.TopicName, channel.ChannelName)
-						client.Guage(stat, int64(item["value"]))
-					}
-				}
-			}
-			lastStats = stats
-
-			if n.getOpts().StatsdMemStats {
-				ms := getMemStats()
-
-				client.Guage("mem.heap_objects", int64(ms.HeapObjects))
-				client.Guage("mem.heap_idle_bytes", int64(ms.HeapIdleBytes))
-				client.Guage("mem.heap_in_use_bytes", int64(ms.HeapInUseBytes))
-				client.Guage("mem.heap_released_byte", int64(ms.HeapReleasedBytes))
-				client.Guage("mem.gc_pause_usec_100", int64(ms.GCPauseUsec100))
-				client.Guage("mem.gc_pause_usec_99", int64(ms.GCPauseUsec99))
-				client.Guage("mem.gc_pause_usec_95", int64(ms.GCPauseUsec95))
-				client.Guage("mem.next_gc_bytes", int64(ms.NextGCBytes))
-				client.Incr("mem.gc_runs", int64(ms.GCTotalRuns-lastMemStats.GCTotalRuns))
-
-				lastMemStats = ms
-			}
-
-			bw.Flush()
-			sw.Flush()
-			conn.Close()
-		}
-	}
-
-exit:
-	ticker.Stop()
-	n.logf(lg.INFO, "STATSD: closing")
-}
-
-// PersistMetadata persist nsqd metadata
-func (n *NSQD) PersistMetadata() error {
-	// TODO
-	panic("NOT IMPLEMENTED")
-}
-
 // SetHealth set error
 func (n *NSQD) SetHealth(err error) {
 	n.errValue.Store(errStore{err: err})
@@ -663,11 +524,6 @@ func (n *NSQD) RemoveClient(clientID int64) {
 	n.clientLock.Unlock()
 }
 
-// IsAuthEnabled return whether auth is enabled
-func (n *NSQD) IsAuthEnabled() bool {
-	return len(n.getOpts().AuthHTTPAddresses) != 0
-}
-
 // RealHTTPSAddr return real port binded for https server
 func (n *NSQD) RealHTTPSAddr() *net.TCPAddr {
 	return n.httpsListener.Addr().(*net.TCPAddr)
@@ -735,4 +591,189 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 			return
 		}
 	}
+}
+
+// IsAuthEnabled return whether auth is enabled
+func (n *NSQD) IsAuthEnabled() bool {
+	return len(n.getOpts().AuthHTTPAddresses) != 0
+}
+
+type meta struct {
+	Topics []struct {
+		Name     string `json:"name"`
+		Paused   bool   `json:"paused"`
+		Channels []struct {
+			Name   string `json:"name"`
+			Paused bool   `json:"paused"`
+		} `json:"channels"`
+	} `json:"topics"`
+}
+
+func newMetadataFile(opts *Options) string {
+	return path.Join(opts.DataPath, "nsqd.dat")
+}
+
+// PersistMetadata persist nsqd metadata
+func (n *NSQD) PersistMetadata() error {
+	// persist metadata about what topics/channels we have, across restarts
+	fileName := newMetadataFile(n.getOpts())
+
+	n.logf(lg.INFO, "NSQ: persisting topic/channel metadata to %s", fileName)
+
+	js := make(map[string]interface{})
+	topics := []interface{}{}
+	for _, topic := range n.topicMap {
+		if topic.ephemeral {
+			continue
+		}
+		topicData := make(map[string]interface{})
+		topicData["name"] = topic.name
+		topicData["paused"] = topic.IsPaused()
+		channels := []interface{}{}
+		topic.Lock()
+		for _, channel := range topic.channelMap {
+			channel.Lock()
+			if channel.ephemeral {
+				channel.Unlock()
+				continue
+			}
+			channelData := make(map[string]interface{})
+			channelData["name"] = channel.name
+			channelData["paused"] = channel.IsPaused()
+			channels = append(channels, channelData)
+			channel.Unlock()
+		}
+		topic.Unlock()
+		topicData["channels"] = channels
+		topics = append(topics, topicData)
+	}
+	js["version"] = version.Binary
+	js["topics"] = topics
+
+	data, err := json.Marshal(&js)
+	if err != nil {
+		return err
+	}
+
+	tmpFileName := fmt.Sprintf("%s.%s.tmp", fileName, rand.Int())
+
+	err = writeSyncFile(tmpFileName, data)
+	if err != nil {
+		return err
+	}
+
+	err = os.Rename(tmpFileName, fileName)
+	if err != nil {
+		return err
+	}
+
+	// technically should fsync DataPath here
+	return nil
+}
+
+func (n *NSQD) LoadMetadata() error {
+	atomic.StoreInt32(&n.isLoading, 1)
+	defer atomic.StoreInt32(&n.isLoading, 0)
+
+	fn := newMetadataFile(n.getOpts())
+
+	data, err := readOrEmpty(fn)
+	if err != nil {
+		return err
+	}
+	if data == nil {
+		return nil // fresh start
+	}
+
+	var m meta
+	err = json.Unmarshal(data, &m)
+	if err != nil {
+		return fmt.Errorf("failed to parse metadata in %s - %s", fn, err)
+	}
+
+	for _, t := range m.Topics {
+		if !protocol.IsValidTopicName(t.Name) {
+			n.logf(lg.WARN, "skipping creation of invalid topic %s", t.Name)
+			continue
+		}
+		topic := n.GetTopic(t.Name)
+		if t.Paused {
+			topic.Pause()
+		}
+		for _, c := range t.Channels {
+			if !protocol.IsValidChannelName(c.Name) {
+				n.logf(lg.WARN, "skipping creation of invalid channel %s", c.Name)
+				continue
+			}
+			channel := topic.GetChannel(c.Name)
+			if c.Paused {
+				channel.Pause()
+			}
+		}
+		topic.Start()
+	}
+	return nil
+}
+
+func readOrEmpty(fn string) ([]byte, error) {
+	data, err := ioutil.ReadFile(fn)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to read metadata from %s - %s", fn, err)
+		}
+	}
+	return data, nil
+}
+
+func writeSyncFile(fn string, data []byte) error {
+	f, err := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+
+	_, err = f.Write(data)
+	if err != nil {
+		return err
+	}
+
+	err = f.Sync()
+	if err != nil {
+		return err
+	}
+
+	err = f.Close()
+	return err
+}
+
+// Exit exit nsqd
+func (n *NSQD) Exit() {
+	if n.tcpListener != nil {
+		n.tcpListener.Close()
+	}
+
+	if n.httpListener != nil {
+		n.httpListener.Close()
+	}
+
+	if n.httpsListener != nil {
+		n.httpsListener.Close()
+	}
+
+	n.Lock()
+	err := n.PersistMetadata()
+	if err != nil {
+		n.logf(lg.ERROR, "failed to persist metadata - %s", err)
+	}
+
+	n.logf(lg.INFO, "NSQ: closing topics")
+	for _, topic := range n.topicMap {
+		topic.Close()
+	}
+	n.Unlock()
+
+	n.logf(lg.INFO, "NSQ: stopping subsystems")
+	close(n.exitChan)
+	n.waitGroup.Wait()
+	n.dl.Unlock()
+	n.logf(lg.INFO, "NSQ: bye")
 }
