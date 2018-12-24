@@ -137,13 +137,13 @@ func (n *NSQD) statsdLoop() {
 
 					for _, item := range channel.E2eProcessingLatency.Percentiles {
 						stat = fmt.Sprintf("topic.%s.channel.%s.e2e_processing_latency_%.0f",
-							topic.TopicName, channel.ChannelName)
+							topic.TopicName, channel.ChannelName, item["quantile"]*100.0)
 						client.Guage(stat, int64(item["value"]))
 					}
 				}
 			}
-			lastStats = stats
 
+			lastStats = stats
 			if n.getOpts().StatsdMemStats {
 				ms := getMemStats()
 

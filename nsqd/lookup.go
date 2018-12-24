@@ -9,12 +9,11 @@ import (
 	"time"
 
 	"github.com/l-nsq/internal/lg"
-
-	"github.com/l-nsq/nsq"
-
 	"github.com/l-nsq/internal/version"
+	"github.com/l-nsq/nsq"
 )
 
+// connectCallback returns a function which will be called when client connect to a lookup peer
 func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 	return func(lp *lookupPeer) {
 		ci := make(map[string]interface{})
@@ -24,6 +23,7 @@ func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 		ci["hostname"] = hostname
 		ci["broadcast_address"] = n.getOpts().BroadcastAddress
 
+		// 1. indentify itself
 		cmd, err := nsq.Identify(ci)
 		if err != nil {
 			lp.Close()
@@ -44,13 +44,16 @@ func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 				n.logf(lg.ERROR, "LOOKUPD(%s): parsing response - %s", lp, resp)
 				lp.Close()
 				return
-			} else {
-				n.logf(lg.INFO, "LOOKUPD(%s): peer info %+v", lp, lp.Info)
-				if lp.Info.BroadcastAddress == "" {
-					n.logf(lg.ERROR, "LOOKUPD(%s): no broadcast address", lp)
-				}
+			}
+
+			n.logf(lg.INFO, "LOOKUPD(%s): peer info %+v", lp, lp.Info)
+			if lp.Info.BroadcastAddress == "" {
+				n.logf(lg.ERROR, "LOOKUPD(%s): no broadcast address", lp)
 			}
 		}
+
+		// if this is a initial connect or a reconnect, need to send all
+		// current topics and channels to peers
 
 		// build all the commands first so we exit the lock(s) as fast as possible
 		var commands []*nsq.Command
@@ -101,6 +104,7 @@ func (n *NSQD) lookupLoop() {
 				n.logf(lg.INFO, "LOOKUP(%s): adding peer", host)
 				lookupPeer := newLookupPeer(host, n.getOpts().MaxBodySize, n.logf,
 					connectCallback(n, hostname))
+
 				lookupPeer.Command(nil) // start the connection
 				lookupPeers = append(lookupPeers, lookupPeer)
 				lookupAddrs = append(lookupAddrs, host)
@@ -108,68 +112,70 @@ func (n *NSQD) lookupLoop() {
 			n.lookupPeers.Store(lookupPeers)
 			connect = false
 		}
-	}
 
-	select {
-	case <-ticker:
-		// send a heartbeat and read a response (read detects closed conns)
-		for _, lookupPeer := range lookupPeers {
-			n.logf(lg.DEBUG, "LOOKUPD(%s): sending heartbeat", lookupPeer)
-			cmd := nsq.Ping()
-			_, err := lookupPeer.Command(cmd)
-			if err != nil {
-				n.logf(lg.ERROR, "LOOKUPD(%s): %s - %s)", lookupPeer, cmd, err)
+		select {
+		case <-ticker:
+			// send a heartbeat and read a response (read detects closed conns)
+			for _, lookupPeer := range lookupPeers {
+				n.logf(lg.DEBUG, "LOOKUPD(%s): sending heartbeat", lookupPeer)
+				cmd := nsq.Ping()
+				_, err := lookupPeer.Command(cmd)
+				if err != nil {
+					n.logf(lg.ERROR, "LOOKUPD(%s): %s - %s)", lookupPeer, cmd, err)
+				}
 			}
-		}
-	case val := <-n.notifyChan:
-		var cmd *nsq.Command
-		var branch string
+		case val := <-n.notifyChan:
+			// notify chan tells channel or topic update, will send message to peers
+			var cmd *nsq.Command
+			var branch string
 
-		switch val.(type) {
-		case *Channel:
-			// notify all nsqlookupds that a new channel exists, or that it's removed
-			branch = "channel"
-			channel := val.(*Channel)
-			if channel.Exiting() {
-				cmd = nsq.UnRegister(channel.topicName, channel.name)
-			} else {
-				cmd = nsq.Register(channel.topicName, channel.name)
+			switch val.(type) {
+			case *Channel:
+				// notify all nsqlookupds that a new channel exists, or that it's removed
+				branch = "channel"
+				channel := val.(*Channel)
+				if channel.Exiting() {
+					cmd = nsq.UnRegister(channel.topicName, channel.name)
+				} else {
+					cmd = nsq.Register(channel.topicName, channel.name)
+				}
+			case *Topic:
+				// notify all nsqlookupds that a new topic exists, or that it's removed
+				branch = "topic"
+				topic := val.(*Topic)
+				if topic.Exiting() {
+					cmd = nsq.UnRegister(topic.name, "")
+				} else {
+					cmd = nsq.Register(topic.name, "")
+				}
 			}
-		case *Topic:
-			// notify all nsqlookupds that a new topic exists, or that it's removed
-			branch = "topic"
-			topic := val.(*Topic)
-			if topic.Exiting() {
-				cmd = nsq.UnRegister(topic.name, "")
-			} else {
-				cmd = nsq.Register(topic.name, "")
-			}
-		}
 
-		for _, lookupPeer := range lookupPeers {
-			n.logf(lg.INFO, "LOOKUPD(%s): %s %s", lookupPeer, branch, cmd)
-			_, err := lookupPeer.Command(cmd)
-			if err != nil {
-				n.logf(lg.ERROR, "LOOKUPD(%s): %s - %s", lookupPeer, cmd, err)
+			for _, lookupPeer := range lookupPeers {
+				n.logf(lg.INFO, "LOOKUPD(%s): %s %s", lookupPeer, branch, cmd)
+				_, err := lookupPeer.Command(cmd)
+				if err != nil {
+					n.logf(lg.ERROR, "LOOKUPD(%s): %s - %s", lookupPeer, cmd, err)
+				}
 			}
-		}
-	case <-n.optsNotificationChan:
-		var tmpPeers []*lookupPeer
-		var tmpAddrs []string
-		for _, lp := range lookupPeers {
-			if in(lp.addr, n.getOpts().NSQLookupdTCPAddress) {
-				tmpPeers = append(tmpPeers, lp)
-				tmpAddrs = append(tmpAddrs, lp.addr)
-				continue
+		case <-n.optsNotificationChan:
+			// update opts may need reconnect to peers
+			var tmpPeers []*lookupPeer
+			var tmpAddrs []string
+			for _, lp := range lookupPeers {
+				if in(lp.addr, n.getOpts().NSQLookupdTCPAddress) {
+					tmpPeers = append(tmpPeers, lp)
+					tmpAddrs = append(tmpAddrs, lp.addr)
+					continue
+				}
+				n.logf(lg.INFO, "LOOKUP(%s): removing peer", lp)
+				lp.Close()
 			}
-			n.logf(lg.INFO, "LOOKUP(%s): removing peer", lp)
-			lp.Close()
+			lookupPeers = tmpPeers
+			lookupAddrs = tmpAddrs
+			connect = true
+		case <-n.exitChan:
+			goto exit
 		}
-		lookupPeers = tmpPeers
-		lookupAddrs = tmpAddrs
-		connect = true
-	case <-n.exitChan:
-		goto exit
 	}
 
 exit:

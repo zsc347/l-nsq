@@ -1,6 +1,9 @@
 package nsqd
 
-import "net"
+import (
+	"io/ioutil"
+	"net"
+)
 
 func mustStartNSQD(opts *Options) (*net.TCPAddr, *net.TCPAddr, *NSQD) {
 	opts.TCPAddress = "127.0.0.1:0"
@@ -17,5 +20,5 @@ func mustStartNSQD(opts *Options) (*net.TCPAddr, *net.TCPAddr, *NSQD) {
 
 	nsqd := New(opts)
 	nsqd.Main()
-	return nsqd.
+	return nsqd.RealTCPAddr(), nsqd.RealHTTPAddr(), nsqd
 }

@@ -5,7 +5,6 @@ import (
 	"net"
 
 	"github.com/l-nsq/internal/lg"
-
 	"github.com/l-nsq/internal/protocol"
 )
 

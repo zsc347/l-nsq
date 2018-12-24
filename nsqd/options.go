@@ -26,6 +26,7 @@ type Options struct {
 	HTTPAddress  string `flag:"http-address"`  // ?
 	HTTPSAddress string `flag:"https-address"` // ?
 
+	// What's broadcastAddress used for ?
 	BroadcastAddress     string   `flag:"broadcast-address"`
 	NSQLookupdTCPAddress []string `flag:"lookupd-tcp-address" cfg:"nsqlookupd_tcp_addresses"`
 

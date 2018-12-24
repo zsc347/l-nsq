@@ -105,6 +105,7 @@ func New(opts *Options) *NSQD {
 		opts.HTTPClientRequestTimeout)
 	n.ci = clusterinfo.New(n.logf, httpcli)
 
+	n.swapOpts(opts)
 	n.lookupPeers.Store([]*lookupPeer{})
 	n.errValue.Store(errStore{})
 
@@ -655,7 +656,7 @@ func (n *NSQD) PersistMetadata() error {
 		return err
 	}
 
-	tmpFileName := fmt.Sprintf("%s.%s.tmp", fileName, rand.Int())
+	tmpFileName := fmt.Sprintf("%s.%d.tmp", fileName, rand.Int())
 
 	err = writeSyncFile(tmpFileName, data)
 	if err != nil {
