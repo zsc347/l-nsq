@@ -30,3 +30,28 @@ func TestPutMessage(t *testing.T) {
 	test.Equal(t, msg.ID, outputMsg.ID)
 	test.Equal(t, msg.Body, outputMsg.Body)
 }
+
+func TestPutMessage2Chan(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	_, _, nsqd := mustStartNSQD(opts)
+	defer os.RemoveAll(opts.DataPath)
+	defer nsqd.Exit()
+
+	topicName := "test_put_message_2chan" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel1 := topic.GetChannel("ch1")
+	channel2 := topic.GetChannel("ch2")
+
+	var id MessageID
+	msg := NewMessage(id, []byte("test"))
+	topic.PutMessage(msg)
+
+	outputMsg1 := <-channel1.memoryMsgChan
+	test.Equal(t, msg.ID, outputMsg1.ID)
+	test.Equal(t, msg.Body, outputMsg1.Body)
+
+	outputMsg2 := <-channel2.memoryMsgChan
+	test.Equal(t, msg.ID, outputMsg2.ID)
+	test.Equal(t, msg.Body, outputMsg2.Body)
+}
