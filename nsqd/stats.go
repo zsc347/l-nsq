@@ -54,7 +54,7 @@ func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
 	inflight := len(c.inFlightMessages)
 	c.inFlightMutex.Unlock()
 	c.deferredMutex.Lock()
-	deferred := len(c.deferedMessages)
+	deferred := len(c.deferredMessages)
 	c.deferredMutex.Unlock()
 
 	return ChannelStats{

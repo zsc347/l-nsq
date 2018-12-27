@@ -66,9 +66,9 @@ type Channel struct {
 	// why implement in different way ? seems no difference
 
 	// TODO: these can be DRYd up
-	deferedMessages map[MessageID]*pqueue.Item
-	deferedPQ       pqueue.PriorityQueue
-	deferredMutex   sync.Mutex
+	deferredMessages map[MessageID]*pqueue.Item
+	deferedPQ        pqueue.PriorityQueue
+	deferredMutex    sync.Mutex
 
 	inFlightMessages map[MessageID]*Message
 	inFlightPQ       inFlightPqueue
@@ -127,7 +127,7 @@ func (c *Channel) initPQ() {
 	c.inFlightMutex.Unlock()
 
 	c.deferredMutex.Lock()
-	c.deferedMessages = make(map[MessageID]*pqueue.Item)
+	c.deferredMessages = make(map[MessageID]*pqueue.Item)
 	c.deferedPQ = pqueue.New(pqSize)
 	c.deferredMutex.Unlock()
 }
@@ -212,9 +212,9 @@ finish:
 func (c *Channel) flush() error {
 	var msgBuf bytes.Buffer
 
-	if len(c.memoryMsgChan) > 0 || len(c.inFlightMessages) > 0 || len(c.deferedMessages) > 0 {
+	if len(c.memoryMsgChan) > 0 || len(c.inFlightMessages) > 0 || len(c.deferredMessages) > 0 {
 		c.ctx.nsqd.logf(lg.INFO, "CHANNEL(%s): flushing %d memory %d in-flight %d defered messages to backend",
-			c.name, len(c.memoryMsgChan), len(c.inFlightMessages), len(c.deferedMessages))
+			c.name, len(c.memoryMsgChan), len(c.inFlightMessages), len(c.deferredMessages))
 	}
 
 	for {
@@ -239,7 +239,7 @@ finish:
 	c.inFlightMutex.Unlock()
 
 	c.deferredMutex.Lock()
-	for _, item := range c.deferedMessages {
+	for _, item := range c.deferredMessages {
 		msg := item.Value.(*Message)
 		err := writeMessageToBackend(&msgBuf, msg, c.backend)
 		if err != nil {
@@ -348,12 +348,12 @@ func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
 	c.deferredMutex.Lock()
 
 	id := item.Value.(*Message).ID
-	_, ok := c.deferedMessages[id]
+	_, ok := c.deferredMessages[id]
 	if ok {
 		c.deferredMutex.Unlock()
 		return errors.New("ID already deferred")
 	}
-	c.deferedMessages[id] = item
+	c.deferredMessages[id] = item
 	c.deferredMutex.Unlock()
 	return nil
 }
@@ -361,11 +361,11 @@ func (c *Channel) pushDeferredMessage(item *pqueue.Item) error {
 func (c *Channel) popDeferredMessage(id MessageID) (*pqueue.Item, error) {
 	c.deferredMutex.Lock()
 	defer c.deferredMutex.Unlock()
-	item, ok := c.deferedMessages[id]
+	item, ok := c.deferredMessages[id]
 	if !ok {
 		return nil, errors.New("ID not deferred")
 	}
-	delete(c.deferedMessages, id)
+	delete(c.deferredMessages, id)
 	return item, nil
 }
 
@@ -510,7 +510,7 @@ func (c *Channel) RemoveClient(clientID int64) {
 	}
 }
 
-// StartInFlightTimeout start timeout of inflight queue
+// StartInFlightTimeout put msg to inflight queue with timeout
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
 	now := time.Now()
 	msg.clientID = clientID
@@ -525,6 +525,8 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 	return nil
 }
 
+// processDeferredQueue find timeout msg from deferred queue
+// put msg back to memeory queue or backend queu
 func (c *Channel) processDeferredQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()
@@ -555,6 +557,8 @@ exit:
 	return dirty
 }
 
+// processInFlightQueue find out timeout messages, record timeout count,
+// if client stil exist, put msg back to memory queue or backend queue
 func (c *Channel) processInFlightQueue(t int64) bool {
 	c.exitMutex.Lock()
 	defer c.exitMutex.Unlock()
