@@ -52,8 +52,8 @@ type identifyEvent struct {
 
 type clientV2 struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	ReadyCount    int64
-	InFlightCount int64
+	ReadyCount    int64 // ReadyCount means client is ready for <ReadyCount> messages, backward pressure
+	InFlightCount int64 // InFlightCount means how many messages is still in flight
 	MessageCount  uint64
 	FinishCount   uint64
 	RequeueCount  uint64

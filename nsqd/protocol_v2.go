@@ -161,7 +161,10 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	// that we've started up
 	close(startedChan)
 
+	// subChannel is the channel that client subscribed
 	for {
+		// if is init when sub chan not specified
+		// or client is not ready for messages, then stop passing message to sub channel
 		if subChannel == nil || !client.IsReadyForMessages() {
 			// the client is not ready to receive messages...
 			// if subscribe channel is not build, then flush client every time
