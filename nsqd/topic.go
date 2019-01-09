@@ -156,6 +156,7 @@ func (t *Topic) messagePump() {
 				memoryMsgChan = t.memoryMsgChan
 				backendChan = t.backend.ReadChan()
 			}
+			continue
 		case <-t.exitChan:
 			goto exit
 		}
@@ -306,6 +307,7 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 	return nil
 }
 
+// put try to put message to memory chan, if it's full, put it bo backend queue
 func (t *Topic) put(m *Message) error {
 	select {
 	case t.memoryMsgChan <- m:
@@ -318,6 +320,7 @@ func (t *Topic) put(m *Message) error {
 			t.ctx.nsqd.logf(lg.ERROR,
 				"TOPIC(%s) ERROR: failed to write message to backend - %s",
 				t.name, err)
+			return err
 		}
 	}
 	return nil
