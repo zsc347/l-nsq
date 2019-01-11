@@ -246,6 +246,7 @@ func BenchmarkTopicToChannelPut(b *testing.B) {
 		topic.PutMessage(msg)
 	}
 
+	// wait on condition chanel.memoryMsgChan == b.N
 	for {
 		if len(channel.memoryMsgChan) == b.N {
 			break
