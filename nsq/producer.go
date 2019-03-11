@@ -76,7 +76,8 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 	}
 
 	p := &Producer{
-		id:     atomic.AddInt64(&instCount, 1),
+		id: atomic.AddInt64(&instCount, 1),
+
 		addr:   addr,
 		config: *config,
 
@@ -84,33 +85,11 @@ func NewProducer(addr string, config *Config) (*Producer, error) {
 		logLvl: LogLevelInfo,
 
 		transactionChan: make(chan *ProducerTransaction),
-
-		exitChan:     make(chan int),
-		responseChan: make(chan []byte),
-		errorChan:    make(chan []byte),
+		exitChan:        make(chan int),
+		responseChan:    make(chan []byte),
+		errorChan:       make(chan []byte),
 	}
 	return p, nil
-}
-
-// NewConn returns a new Conn instance
-func NewConn(addr string, config *Config, delegate ConnDelegate) *Conn {
-	if !config.initialized {
-		panic("Config must be created with NewConfig()")
-	}
-	return &Conn{
-		addr: addr,
-
-		config:   config,
-		delegate: delegate,
-
-		maxRdyCount:      2500,
-		lastMsgTimestamp: time.Now().UnixNano(),
-
-		cmdChan:         make(chan *Command),
-		msgResponseChan: make(chan *msgResponse),
-		exitChan:        make(chan int),
-		drainReady:      make(chan int),
-	}
 }
 
 // Ping causes the Producer to connect to it's configured nsqd (if not already
@@ -167,6 +146,96 @@ func (w *Producer) Stop() {
 	w.close()
 	w.guard.Unlock()
 	w.wg.Wait()
+}
+
+// PublishAsync publishes a message body to the specified topic
+// but does not wait for the response from `nsqd`
+//
+// When the Producer eventually receives the response from `nsqd`,
+// the supplied `doneChan` (if specified)
+// will receive a `ProducerTransaction` instance with the supplied variadic arguments
+// and the response error if present
+func (w *Producer) PublishAsync(topic string, body []byte,
+	doneChan chan *ProducerTransaction, args ...interface{}) error {
+	return w.sendCommandAsync(Publish(topic, body), doneChan, args)
+}
+
+// MultiPublishAsync publishes a slice of message bodies to the specified topic
+// but does not wait for the response from `nsqd`
+//
+// When the Producer eventually receives the response from `nsqd`,
+// the supplied `doneChan` (if specified)
+// will receive a `ProducerTransaction` instance with the suplied variadic arguments
+// and the response error if present
+func (w *Producer) MultiPublishAsync(topic string, body [][]byte,
+	doneChan chan *ProducerTransaction, args ...interface{}) error {
+	cmd, err := MultiPublish(topic, body)
+	if err != nil {
+		return err
+	}
+	return w.sendCommandAsync(cmd, doneChan, args)
+}
+
+// Publish synchronously publishes a message body to the specified topic,
+// returning an error if publish failed
+func (w *Producer) Publish(topic string, body []byte) error {
+	return w.sendCommand(Publish(topic, body))
+}
+
+// MultiPublish synchronously publishes a slice of message bodies to the specified
+// topic, returning an error if publish failed
+func (w *Producer) MultiPublish(topic string, body [][]byte) error {
+	cmd, err := MultiPublish(topic, body)
+	if err != nil {
+		return err
+	}
+	return w.sendCommand(cmd)
+}
+
+// DeferredPublish synchronnously publishes a message body to the specified topic
+// where the message will queue at the channel level util timeout expires,
+// returning an error if publish failed
+func (w *Producer) DeferredPublish(topic string, deplay time.Duration, body []byte) error {
+	return w.sendCommand(DeferredPublish(topic, deplay, body))
+}
+
+func (w *Producer) sendCommand(cmd *Command) error {
+	doneChan := make(chan *ProducerTransaction)
+	err := w.sendCommandAsync(cmd, doneChan, nil)
+	if err != nil {
+		close(doneChan)
+		return err
+	}
+	t := <-doneChan
+	return t.Error
+}
+
+func (w *Producer) sendCommandAsync(cmd *Command, doneChan chan *ProducerTransaction,
+	args []interface{}) error {
+	// keep track of how many outstanding producers we're dealing with
+	// in order to later ensure that we clean them all up...
+	atomic.AddInt32(&w.concurrentProducers, 1)
+	defer atomic.AddInt32(&w.concurrentProducers, -1)
+
+	if atomic.LoadInt32(&w.state) != StateConnected {
+		err := w.connect()
+		if err != nil {
+			return err
+		}
+	}
+
+	t := &ProducerTransaction{
+		cmd:      cmd,
+		doneChan: doneChan,
+		Args:     args,
+	}
+
+	select {
+	case w.transactionChan <- t:
+	case <-w.exitChan:
+		return ErrStopped
+	}
+	return nil
 }
 
 func (w *Producer) close() {
