@@ -203,6 +203,11 @@ func (c *Conn) RDY() int64 {
 	return atomic.LoadInt64(&c.rdyCount)
 }
 
+// LastRDY returns the previously set RDY count
+func (c *Conn) LastRDY() int64 {
+	return atomic.LoadInt64(&c.lastRdyCount)
+}
+
 // SetRDY stores the specified RDY count
 func (c *Conn) SetRDY(rdy int64) {
 	atomic.StoreInt64(&c.rdyCount, rdy)
