@@ -1,12 +1,16 @@
 package nsq
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -366,6 +370,490 @@ func validateLookupAddr(addr string) error {
 	return nil
 }
 
+// poll all known lookup servers every LookupPollInterval
+func (r *Consumer) lookupdLoop() {
+	// add some jitter so that multiple consumers discovering the same topic,
+	// when restarted at the same time, don't all connect at once
+	r.rngMtx.Lock()
+	jitter := time.Duration(int64(r.rng.Float64() *
+		r.config.LookupdPollJitter * float64(r.config.LookupdPollInterval)))
+	r.rngMtx.Unlock()
+	var ticker *time.Ticker
+
+	select {
+	case <-time.After(jitter):
+	case <-r.exitChan:
+		goto exit
+	}
+
+	ticker = time.NewTicker(r.config.LookupdPollInterval)
+
+	for {
+		select {
+		case <-ticker.C:
+			r.queryLookupd()
+		case <-r.lookupdRecheckChan:
+			r.queryLookupd()
+		case <-r.exitChan:
+			goto exit
+		}
+	}
+exit:
+	if ticker != nil {
+		ticker.Stop()
+	}
+	r.log(LogLevelInfo, "exiting lookupdLoop")
+	r.wg.Done()
+}
+
+// return the next lookupd endpoint to query
+// keeping track of which one was last used
+func (r *Consumer) nextLookupdEndpoint() string {
+	r.mtx.RLock()
+	if r.lookupQueryIndex >= len(r.lookupdHTTPAddrs) {
+		r.lookupQueryIndex = 0
+	}
+	addr := r.lookupdHTTPAddrs[r.lookupQueryIndex]
+	num := len(r.lookupdHTTPAddrs)
+	r.mtx.RUnlock()
+
+	r.lookupQueryIndex = (r.lookupQueryIndex + 1) % num
+
+	urlString := addr
+	if !strings.Contains(urlString, "://") {
+		urlString = "http://" + addr
+	}
+
+	u, err := url.Parse(urlString)
+	if err != nil {
+		panic(err)
+	}
+	if u.Path == "/" || u.Path == "" {
+		u.Path = "/lookup"
+	}
+	v, err := url.ParseQuery(u.RawQuery)
+	v.Add("topic", r.topic)
+	u.RawQuery = v.Encode()
+	return u.String()
+}
+
+type lookupResp struct {
+	Channels  []string    `json:"channels"`
+	Producers []*peerInfo `json:"producers"`
+	Timestamp int64       `jso:"timestamp"`
+}
+
+type peerInfo struct {
+	RemoteAddress    string `json:"remote_address"`
+	Hostname         string `json:"hostname"`
+	BroadcastAddress string `json:"broadcast_address"`
+	TCPPort          int    `json:"tcp_port"`
+	HTTPPort         int    `json:"http_port"`
+	Version          string `json:"version"`
+}
+
+// make an HTTP req to one of the configured nsqlookupd instances to discover
+// which nsqd's provide the topic we are consuming.
+//
+// initiate a connection to any new producers that are identified.
+func (r *Consumer) queryLookupd() {
+	endpoint := r.nextLookupdEndpoint()
+
+	r.log(LogLevelInfo, "querying nsqlookupd %s", endpoint)
+
+	var data lookupResp
+	err := apiRequestNegotiateV1("GET", endpoint, nil, &data)
+	if err != nil {
+		r.log(LogLevelError, "error querying nsqlookupd (%s) - %s", endpoint, err)
+		return
+	}
+
+	var nsqdAddrs []string
+	for _, producer := range data.Producers {
+		broadcastAddress := producer.BroadcastAddress
+		port := producer.TCPPort
+		joined := net.JoinHostPort(broadcastAddress, strconv.Itoa(port))
+		nsqdAddrs = append(nsqdAddrs, joined)
+	}
+
+	// apply filter
+	if DiscoveryFilter, ok := r.behaviorDelegate.(DiscoveryFilter); ok {
+		nsqdAddrs = DiscoveryFilter.Filter(nsqdAddrs)
+	}
+
+	for _, addr := range nsqdAddrs {
+		err = r.ConnectToNSQD(addr)
+		if err != nil && err != ErrAlreadyConnected {
+			r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
+			continue
+		}
+	}
+}
+
+// ConnectToNSQDs takes multiple nsqd addresses to connect directly to.
+//
+// It is recommended to use ConnectToNSQLookupd so that topics are discoverred
+// automatially. This method is useful when you want to connect to local instance
+func (r *Consumer) ConnectToNSQDs(addresses []string) error {
+	for _, addr := range addresses {
+		err := r.ConnectToNSQD(addr)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ConnectToNSQD takes a nsqd address to connect directly to.
+//
+// It is recommended to use ConnectToNSQLookupd so that topics are discovered
+// automatically. This method is useful when you want to connect to a single,
+// local instance
+func (r *Consumer) ConnectToNSQD(addr string) error {
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		return errors.New("Consumer stopped")
+	}
+
+	if atomic.LoadInt32(&r.runningHandlers) == 0 {
+		return errors.New("no handlers")
+	}
+
+	atomic.StoreInt32(&r.connectedFlag, 1)
+
+	logger, loglvl := r.getLogger()
+
+	conn := NewConn(addr, &r.config, &consumerConnDelegate{r})
+	conn.SetLogger(logger, loglvl,
+		fmt.Sprintf("%3d [%s/%s] (%%s)", r.id, r.topic, r.channel))
+
+	r.mtx.Lock()
+	_, pendingOk := r.pendingConnections[addr]
+	_, ok := r.connections[addr]
+	if ok || pendingOk {
+		r.mtx.Unlock()
+		return ErrAlreadyConnected
+	}
+	r.pendingConnections[addr] = conn
+	if idx := indexOf(addr, r.nsqdTCPAddrs); idx == -1 {
+		r.nsqdTCPAddrs = append(r.nsqdTCPAddrs, addr)
+	}
+	r.mtx.Unlock()
+
+	r.log(LogLevelInfo, "%s connecting to nsqd", addr)
+
+	cleanupConnection := func() {
+		r.mtx.Lock()
+		delete(r.pendingConnections, addr)
+		r.mtx.Unlock()
+		conn.Close()
+	}
+
+	resp, err := conn.Connect()
+	if err != nil {
+		cleanupConnection()
+		return err
+	}
+
+	if resp != nil {
+		if resp.MaxRdyCount < int64(r.getMaxInFlight()) {
+			r.log(LogLevelWarning,
+				"%s max RDY count %d < consumer max in flight %d, truncation possible",
+				conn.String(), resp.MaxRdyCount, r.getMaxInFlight())
+		}
+	}
+
+	cmd := Subscribe(r.topic, r.channel)
+	err = conn.WriteCommand(cmd)
+	if err != nil {
+		cleanupConnection()
+		return fmt.Errorf("[%s] failed to subscribe to %s:%s - %s",
+			conn, r.topic, r.channel, err.Error())
+	}
+
+	r.mtx.Lock()
+	delete(r.pendingConnections, addr)
+	r.connections[addr] = conn
+	r.mtx.Unlock()
+
+	for _, c := range r.conns() {
+		r.maybeUpdateRDY(c)
+	}
+
+	return nil
+}
+
+func indexOf(n string, h []string) int {
+	for i, a := range h {
+		if n == a {
+			return i
+		}
+	}
+	return -1
+}
+
+// DisconnectFromNSQD closes the connection to and removes the specified
+// `nsqd` address from the list
+func (r Consumer) DisconnectFromNSQD(addr string) error {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+
+	idx := indexOf(addr, r.nsqdTCPAddrs)
+	if idx == -1 {
+		return ErrNotConnected
+	}
+
+	// slice delete
+	r.nsqdTCPAddrs = append(r.nsqdTCPAddrs[:idx], r.nsqdTCPAddrs[idx+1:]...)
+
+	pendingConn, pendingOk := r.pendingConnections[addr]
+	conn, ok := r.connections[addr]
+
+	if ok {
+		conn.Close()
+	} else if pendingOk {
+		pendingConn.Close()
+	}
+
+	return nil
+}
+
+// DisconnectFromNSQLookupd removes the specified `nsqlookupd` address
+// from the list used for periodic discovery.
+func (r *Consumer) DisconnectFromNSQLookupd(addr string) error {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+
+	idx := indexOf(addr, r.lookupdHTTPAddrs)
+	if idx == -1 {
+		return ErrNotConnected
+	}
+
+	if len(r.lookupdHTTPAddrs) == 1 {
+		return fmt.Errorf("cannot disconnect from only remaining nsqlookupd HTTP address %s",
+			addr)
+	}
+
+	r.lookupdHTTPAddrs = append(r.lookupdHTTPAddrs[:idx], r.lookupdHTTPAddrs[idx+1:]...)
+
+	return nil
+}
+
+func (r *Consumer) onConnMessage(c *Conn, msg *Message) {
+	atomic.AddInt64(&r.totalRdyCount, -1)
+	atomic.AddUint64(&r.messagesReceived, 1)
+	r.incomingMessages <- msg
+	r.maybeUpdateRDY(c)
+}
+
+func (r *Consumer) onConnMessageFinished(c *Conn, msg *Message) {
+	atomic.AddUint64(&r.messagesFinished, 1)
+}
+
+func (r *Consumer) onConnMessageRequeued(c *Conn, msg *Message) {
+	atomic.AddUint64(&r.messagesRequeued, 1)
+}
+
+func (r *Consumer) onConnBackoff(c *Conn) {
+	r.startStopContinueBackoff(c, backoffFlag)
+}
+
+func (r *Consumer) onConnContinue(c *Conn) {
+	r.startStopContinueBackoff(c, continueFlag)
+}
+
+func (r *Consumer) onConnResume(c *Conn) {
+	r.startStopContinueBackoff(c, resumeFlag)
+}
+
+func (r *Consumer) onConnResponse(c *Conn, data []byte) {
+	switch {
+	case bytes.Equal(data, []byte("CLOSE_WAIT")):
+		// server is ready for us to close (it ack'd our StatClose)
+		r.log(LogLevelInfo, "(%s) received CLOSE_WAIT from nsqd", c.String())
+		c.Close()
+	}
+}
+
+func (r *Consumer) onConnError(c *Conn, data []byte) {
+
+}
+
+func (r *Consumer) onConnHeartbeat(c *Conn) {
+
+}
+
+func (r *Consumer) onConnIOError(c *Conn, err error) {
+	c.Close()
+}
+
+func (r *Consumer) onConnClose(c *Conn) {
+
+	rdyCount := c.RDY()
+	// remove this connections RDY count from the consumer's total
+	atomic.AddInt64(&r.totalRdyCount, -rdyCount)
+
+	var hasRDYRetryTimer bool
+	r.rdyRetryMtx.Lock()
+	if timer, ok := r.rdyRetryTimers[c.String()]; ok {
+		// stop any pending retry of an old RDY update
+		timer.Stop()
+		delete(r.rdyRetryTimers, c.String())
+		hasRDYRetryTimer = true
+	}
+	r.rdyRetryMtx.Unlock()
+
+	r.mtx.Lock()
+	delete(r.connections, c.String())
+	left := len(r.connections)
+	r.mtx.Unlock()
+
+	r.log(LogLevelWarning, "there are %d connections left alive", left)
+
+	if (hasRDYRetryTimer || rdyCount > 0) &&
+		(int32(left) == r.getMaxInFlight() || r.inBackoff()) {
+		// we're toggling out of (normal) redistribution cases and this conn
+		// had a RDY count ...
+		//
+		// trigger RDY redistribution to make sure this RDY is moved
+		// to a new connection
+		atomic.StoreInt32(&r.needRDYRedistributed, 1)
+	}
+
+	// we were the last one (and stopping)
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		if left == 0 {
+			r.stopHandlers()
+		}
+		return
+	}
+
+	r.mtx.RLock()
+	numLookupd := len(r.lookupdHTTPAddrs)
+	reconnect := indexOf(c.String(), r.nsqdTCPAddrs) >= 0
+	r.mtx.RUnlock()
+
+	if numLookupd > 0 {
+		// trigger a poll of the lookupd
+		select {
+		case r.lookupdRecheckChan <- 1:
+		default:
+		}
+	} else if reconnect {
+		// there are no lookupd and we still have this nsqd TCP address
+		// in our list...
+		// try to reconnect after a bit
+		go func(addr string) {
+			for {
+				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr,
+					r.config.LookupdPollInterval)
+				time.Sleep(r.config.LookupdPollInterval)
+				if atomic.LoadInt32(&r.stopFlag) == 1 {
+					break
+				}
+				r.mtx.RLock()
+				reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
+				r.mtx.RUnlock()
+
+				if !reconnect {
+					r.log(LogLevelWarning, "%s skipped reconnect after removal ...", addr)
+					return
+				}
+
+				err := r.ConnectToNSQD(addr)
+				if err != nil && err != ErrAlreadyConnected {
+					r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
+					continue
+				}
+				break
+			}
+		}(c.String())
+	}
+}
+
+func (r *Consumer) startStopContinueBackoff(conn *Conn, signal backoffSignal) {
+	// prevent may async failures/successes from immetiately resulting in
+	// max backoff/normal rate (by ensuring that we don't continually incr/decr
+	// the counter during a backoff period)
+	r.backoffMtx.Lock()
+	if r.inBackoffTimeout() {
+		r.backoffMtx.Unlock()
+		return
+	}
+	defer r.backoffMtx.Unlock()
+
+	// update backoff state
+	backoffUpdated := false
+	backoffCounter := atomic.LoadInt32(&r.backoffCounter)
+	switch signal {
+	case resumeFlag:
+		if backoffCounter > 0 {
+			backoffCounter--
+			backoffUpdated = true
+		}
+	case backoffFlag:
+		nextBackoff := r.config.BackoffStrategy.Calculate(int(backoffCounter) + 1)
+		if nextBackoff <= r.config.MaxBackoffDuration {
+			backoffCounter++
+			backoffUpdated = true
+		}
+	}
+	atomic.StoreInt32(&r.backoffCounter, backoffCounter)
+
+	if r.backoffCounter == 0 && backoffUpdated {
+		// exit backoff
+		count := r.perConnMaxInFlight()
+		r.log(LogLevelWarning, "exiting backoff, returning all to RDY %d", count)
+		for _, c := range r.conns() {
+			r.updateRDY(c, count)
+		}
+	} else if r.backoffCounter > 0 {
+		// start or continue backoff
+		backoffDuration := r.config.BackoffStrategy.Calculate(int(backoffCounter))
+
+		if backoffDuration > r.config.MaxBackoffDuration {
+			backoffDuration = r.config.MaxBackoffDuration
+		}
+
+		r.log(LogLevelWarning,
+			"backing off for %d (backoff level %d), setting all to RDY 0",
+			backoffDuration, backoffCounter)
+
+		// send RDY 0 immediately (to *all* connections)
+		for _, c := range r.conns() {
+			r.updateRDY(c, 0)
+		}
+		r.backoff(backoffDuration)
+	}
+}
+
+func (r *Consumer) backoff(d time.Duration) {
+	atomic.StoreInt64(&r.backoffDuration, d.Nanoseconds())
+	time.AfterFunc(d, r.resume)
+}
+
+func (r *Consumer) resume() {
+	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		atomic.StoreInt64(&r.backoffDuration, 0)
+		return
+	}
+
+	// pick a random connection to tet the waters
+	conns := r.conns()
+	if len(conns) == 0 {
+		r.log(LogLevelWarning, "no connection avalable to resume")
+		r.log(LogLevelWarning, "backing off for %s", time.Second)
+		r.backoff(time.Second)
+		return
+	}
+}
+
+func (r *Consumer) stopHandlers() {
+	r.stopHandler.Do(func() {
+		r.log(LogLevelInfo, "stopping handlers")
+		close(r.incomingMessages)
+	})
+}
+
 func (r *Consumer) maybeUpdateRDY(conn *Conn) {
 	inBackoff := r.inBackoff()
 	inBackoffTimeout := r.inBackoffTimeout()
@@ -386,4 +874,17 @@ func (r *Consumer) maybeUpdateRDY(conn *Conn) {
 		r.log(LogLevelDebug, "(%s) skip sending RDY %d (%d remain out of last RDY %d)",
 			conn, count, remain, lastRdyCount)
 	}
+}
+
+func (r *Consumer) log(lvl LogLevel, line string, args ...interface{}) {
+	logger, logLvl := r.getLogger()
+	if logger == nil {
+		return
+	}
+	if logLvl > lvl {
+		return
+	}
+	logger.Output(2, fmt.Sprintf("%-4s %3d [%s/%s] %s",
+		lvl, r.id, r.topic, r.channel,
+		fmt.Sprintf(line, args...)))
 }
