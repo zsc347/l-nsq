@@ -120,6 +120,9 @@ type Config struct {
 	// counts are re-distributes (ie. max_in_flight < num producers)
 	LowRdyIdleTimeout time.Duration `opt:"low_rdy_idle_timeout" min:"1s" max:"5m" default:"10s"`
 
+	// Duration between redistributing max-in-flight to connections
+	RDYRedistributeInterval time.Duration `opt:"rdy_redistribute_interval" min:"1s" max:"5m" default:"10s"`
+
 	// Identifiers sent to nsqd representing this client
 	// UserAgent is in the spirit of HTTP (default: "<client_library_name>/<version>")
 	ClientID  string `opt:"client_id"`

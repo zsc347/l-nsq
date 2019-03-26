@@ -17,6 +17,19 @@ const (
 	LogLevelError
 )
 
+// String returns the string form for a given LogLevel
+func (lvl LogLevel) string() string {
+	switch lvl {
+	case LogLevelInfo:
+		return "INFO"
+	case LogLevelWarning:
+		return "WARN"
+	case LogLevelError:
+		return "ERROR"
+	}
+	return "DBG"
+}
+
 // MessageDelegate is an interface of methods that are used
 // as callcacks in Message
 type MessageDelegate interface {
