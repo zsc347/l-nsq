@@ -18,7 +18,7 @@ const (
 )
 
 // String returns the string form for a given LogLevel
-func (lvl LogLevel) string() string {
+func (lvl LogLevel) String() string {
 	switch lvl {
 	case LogLevelInfo:
 		return "INFO"
